@@ -1,0 +1,11 @@
+.help {
+  position: absolute;
+  top: 600px;
+  left: 20px;
+  right: 260px;
+  max-width: 500px;
+}
+
+.hud.top-right {
+  padding: 16px 20px;
+}
