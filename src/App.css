@@ -8,4 +8,8 @@
 
 .hud.top-right {
   padding: 16px 20px;
+  position: absolute;
+  top: 20px;
+  right: 20px;
+  width: 920px;
 }

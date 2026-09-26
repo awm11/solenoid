@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import './App.css';
 
 /*
  * More, shorter sections.
@@ -19,19 +18,18 @@ import './App.css';
  */
 const SECTION_COUNT = 72;
 const SECTION_LENGTH = 0.52;
+const TAIL_PULL_RATIO = 0.75;
 
 const COIL_RADIUS = 1.75;
 const COIL_PITCH = 0.2;
 const COIL_TURNS = 6.5;
+const PULSE_REPEAT_TURNS = 3;
 
 // Number of points used to actually curve each wire section.
 const SECTION_CURVE_SAMPLES = 8;
 
 // Visual field resolution.
 const FIELD_STEPS = 7;
-
-// Shift+click can highlight at most this many sections at once.
-const MAX_SELECTED_SECTIONS = 2;
 
 function lerpVec3(a, b, t) {
   return new THREE.Vector3().lerpVectors(a, b, t);
@@ -82,13 +80,14 @@ const STRAIGHT_OFFSET = new THREE.Vector3(
   -3, // Z
 );
 
-function makeStraightPoint(index) {
+function makeStraightPoint(index, tailPull = 0) {
   const total =
     SECTION_COUNT * SECTION_LENGTH;
 
   return new THREE.Vector3(
     -total / 2 +
-      index * SECTION_LENGTH,
+      index * SECTION_LENGTH -
+      tailPull,
     0,
     0,
   ).add(STRAIGHT_OFFSET);
@@ -164,12 +163,19 @@ function getSectionPath(
   wrappedCount,
   animatedWrap = 1,
   pitch = COIL_PITCH,
+  tailPull = 0,
 ) {
   const straightA =
-    makeStraightPoint(sectionIndex);
+    makeStraightPoint(
+      sectionIndex,
+      tailPull,
+    );
 
   const straightB =
-    makeStraightPoint(sectionIndex + 1);
+    makeStraightPoint(
+      sectionIndex + 1,
+      tailPull,
+    );
 
   /*
    * Completely unwrapped.
@@ -224,6 +230,7 @@ function getAllSectionPaths(
   wrappedCount,
   animatedWrap = 1,
   pitch = COIL_PITCH,
+  tailPull = 0,
 ) {
   return Array.from(
     { length: SECTION_COUNT },
@@ -238,6 +245,7 @@ function getAllSectionPaths(
         wrappedCount,
         wrapAmount,
         pitch,
+        tailPull,
       );
     },
   );
@@ -263,6 +271,8 @@ function getAnimatedSectionPaths(
   toCount,
   t,
   pitch = COIL_PITCH,
+  previousPaths,
+  tailPull = 0,
 ) {
   const easingT =
     Math.max(0, Math.min(1, t));
@@ -274,6 +284,14 @@ function getAnimatedSectionPaths(
     i < SECTION_COUNT;
     i++
   ) {
+    if (
+      previousPaths &&
+      i < Math.min(fromCount, toCount)
+    ) {
+      paths.push(previousPaths[i]);
+      continue;
+    }
+
     let wrapAmount = 0;
 
     if (toCount > fromCount) {
@@ -320,6 +338,7 @@ function getAnimatedSectionPaths(
         1,
         wrapAmount,
         pitch,
+        tailPull,
       ),
     );
   }
@@ -1141,6 +1160,7 @@ function makeSectionSeeds(
 function buildCombinedField(
   sectionPaths,
   activeCount,
+  lineCount = 18,
 ) {
   const group =
     new THREE.Group();
@@ -1149,34 +1169,36 @@ function buildCombinedField(
     return group;
   }
 
+  /*
+   * Seed the requested number of lines at evenly-spaced axial positions
+   * and around the coil axis.  Alternating inner/outer seed radii gives
+   * the combined field a useful mix of lines through the solenoid and
+   * return lines outside it, while the golden-angle rotation avoids the
+   * visible three-cluster pattern of the old fixed seed set.
+   */
   const seeds = [];
+  const count = Math.max(1, Math.round(lineCount));
+  const axisCenterZ = COIL_RADIUS;
+  const goldenAngle =
+    Math.PI * (3 - Math.sqrt(5));
 
-  const loops = 10;
+  for (let i = 0; i < count; i++) {
+    const axialFraction =
+      count === 1
+        ? 0.5
+        : (i + 0.5) / count;
 
-  for (
-    let xIndex = 0;
-    xIndex < 3;
-    xIndex++
-  ) {
-    const sectionIndex =
-      Math.min(
-        activeCount - 1,
-        Math.floor(
-          (xIndex / 2) *
-            Math.max(
-              activeCount - 1,
-              0,
-            ),
-        ),
-      );
+    const sectionIndex = Math.min(
+      activeCount - 1,
+      Math.floor(
+        axialFraction * activeCount,
+      ),
+    );
 
     const sectionPath =
-      sectionPaths[
-        sectionIndex
-      ];
+      sectionPaths[sectionIndex];
 
-    const center =
-      new THREE.Vector3();
+    const center = new THREE.Vector3();
 
     sectionPath.forEach((p) =>
       center.add(p),
@@ -1186,38 +1208,46 @@ function buildCombinedField(
       1 / sectionPath.length,
     );
 
-    for (
-      let i = 0;
-      i < loops;
-      i++
-    ) {
-      const angle =
-        (i / loops) *
-        Math.PI *
-        2;
+    const angle =
+      i * goldenAngle;
 
-      seeds.push(
-        new THREE.Vector3(
-          center.x,
-          Math.cos(angle) *
-            2.4,
-          2.1 +
-            Math.sin(angle) *
-              2.4,
-        ),
-      );
-    }
+    const radius =
+      i % 2 === 0
+        ? Math.min(1.35, COIL_RADIUS * 0.72)
+        : COIL_RADIUS + 0.85;
+
+    seeds.push(
+      new THREE.Vector3(
+        center.x,
+        Math.cos(angle) * radius,
+        axisCenterZ +
+          Math.sin(angle) * radius,
+      ),
+    );
   }
 
   seeds.forEach(
     (seed, seedIndex) => {
-      const traced =
+      const forward =
         traceCombinedStreamline(
           seed,
           1,
           sectionPaths,
           activeCount,
         );
+
+      const backward =
+        traceCombinedStreamline(
+          seed,
+          -1,
+          sectionPaths,
+          activeCount,
+        );
+
+      const traced = [
+        ...backward.reverse().slice(0, -1),
+        ...forward,
+      ];
 
       if (traced.length < 8) {
         return;
@@ -1272,18 +1302,15 @@ function buildCombinedField(
 }
 
 /*
- * Every wrapped section gets its own independent field visualization.
+ * Every section gets its own independent field visualization.
  */
 function buildAllContributionsField(
   sectionPaths,
   activeCount,
+  sectionIndices,
 ) {
   const group =
     new THREE.Group();
-
-  if (activeCount <= 0) {
-    return group;
-  }
 
   const palette = [
     0xff5f8f,
@@ -1300,9 +1327,24 @@ function buildAllContributionsField(
 
   for (
     let sectionIndex = 0;
-    sectionIndex < activeCount;
+    sectionIndex < SECTION_COUNT;
     sectionIndex++
   ) {
+    if (
+      sectionIndices &&
+      !sectionIndices.includes(
+        sectionIndex,
+      )
+    ) {
+      continue;
+    }
+
+    const sectionGroup =
+      new THREE.Group();
+
+    sectionGroup.userData.sectionIndex =
+      sectionIndex;
+
     const sectionPath =
       sectionPaths[
         sectionIndex
@@ -1341,7 +1383,7 @@ function buildAllContributionsField(
       0.60,
     ].forEach(
       (radius, ringIndex) => {
-        group.add(
+        sectionGroup.add(
           makeFieldRing(
             center,
             tangent,
@@ -1387,13 +1429,15 @@ function buildAllContributionsField(
           depthWrite: false,
         });
 
-      group.add(
+      sectionGroup.add(
         new THREE.Line(
           geometry,
           material,
         ),
       );
     });
+
+    group.add(sectionGroup);
   }
 
   return group;
@@ -1554,9 +1598,7 @@ function FieldLegend({
       'Individual contributions';
 
     description =
-      wrappedCount > 0
-        ? `All ${wrappedCount} wrapped sections shown independently`
-        : 'Wrap sections to reveal their fields';
+      'All sections shown independently';
   }
 
   if (mode === 'individual') {
@@ -1578,6 +1620,14 @@ function FieldLegend({
         : 'Only the selected section contributes';
   }
 
+  if (mode === 'none') {
+    title =
+      'No field shown';
+
+    description =
+      'The magnetic field visualization is hidden';
+  }
+
   return (
     <div className="field-legend">
       <div className="legend-title">
@@ -1591,7 +1641,9 @@ function FieldLegend({
               ? 'cyan'
               : mode === 'all'
                 ? 'rainbow'
-                : 'pink'
+                : mode === 'individual'
+                  ? 'pink'
+                  : ''
           }`}
         />
 
@@ -1607,6 +1659,9 @@ export default function App() {
   const mountRef =
     useRef(null);
 
+  const webglFallbackRef =
+    useRef(null);
+
   const [
     wrappedCount,
     setWrappedCount,
@@ -1620,15 +1675,22 @@ export default function App() {
   const [mode, setMode] =
     useState('combined');
 
+  const [showCurrent, setShowCurrent] =
+    useState(true);
+
   const stateRef =
     useRef({
       wrappedCount: 0,
       selectedSections: [],
       mode: 'combined',
+      combinedLineCount: 18,
     });
 
   const [coilPitch, setCoilPitch] =
     useState(COIL_PITCH);
+
+  const [combinedLineCount, setCombinedLineCount] =
+    useState(18);
 
   const coilPitchRef =
     useRef(COIL_PITCH);
@@ -1644,6 +1706,9 @@ export default function App() {
 
   stateRef.current.mode =
     mode;
+
+  stateRef.current.combinedLineCount =
+    combinedLineCount;
 
   useEffect(() => {
     const mount =
@@ -1675,11 +1740,36 @@ export default function App() {
       12.5,
     );
 
-    const renderer =
-      new THREE.WebGLRenderer({
-        antialias: true,
-        alpha: false,
-      });
+    let renderer;
+
+    try {
+      renderer =
+        new THREE.WebGLRenderer({
+          antialias: true,
+          alpha: false,
+        });
+    } catch {
+      try {
+        renderer =
+          new THREE.WebGLRenderer({
+            antialias: false,
+            alpha: false,
+            powerPreference: 'low-power',
+          });
+      } catch (error) {
+        console.warn(
+          'Unable to create the WebGL renderer:',
+          error,
+        );
+
+        if (webglFallbackRef.current) {
+          webglFallbackRef.current.hidden =
+            false;
+        }
+
+        return undefined;
+      }
+    }
 
     renderer.setPixelRatio(
       Math.min(
@@ -1813,6 +1903,37 @@ export default function App() {
     );
     root.add(pulseGroup);
 
+    const sectionWireGroups =
+      Array.from(
+        { length: SECTION_COUNT },
+        () => new THREE.Group(),
+      );
+
+    const sectionInteractionGroups =
+      Array.from(
+        { length: SECTION_COUNT },
+        () => new THREE.Group(),
+      );
+
+    const sectionPulseGroups =
+      Array.from(
+        { length: SECTION_COUNT },
+        () => new THREE.Group(),
+      );
+
+    sectionWireGroups.forEach(
+      (group) => wireGroup.add(group),
+    );
+
+    sectionInteractionGroups.forEach(
+      (group) =>
+        interactionGroup.add(group),
+    );
+
+    sectionPulseGroups.forEach(
+      (group) => pulseGroup.add(group),
+    );
+
     const raycaster =
       new THREE.Raycaster();
 
@@ -1824,6 +1945,8 @@ export default function App() {
     let animationKind = null;
     let animationFrom = 0;
     let animationTo = 0;
+    let tailPullFrom = 0;
+    let tailPullTo = 0;
 
     const hitTargets = [];
 
@@ -1835,6 +1958,7 @@ export default function App() {
           coilPitchRef.current,
         ),
 
+      tailPull: 0,
       fieldBlend: 1,
       fieldBlendTarget: 1,
     };
@@ -1846,44 +1970,47 @@ export default function App() {
       sectionPaths,
       currentWrappedCount,
       activeSelections,
+      changedRange,
     ) {
-      while (
-        wireGroup.children.length
-      ) {
-        const child =
-          wireGroup.children.pop();
+      const startIndex =
+        changedRange
+          ? changedRange.start
+          : 0;
 
-        disposeObject(child);
-      }
+      const endIndex =
+        changedRange
+          ? changedRange.end
+          : SECTION_COUNT;
 
-      while (
-        interactionGroup.children.length
-      ) {
-        const child =
-          interactionGroup.children.pop();
-
-        disposeObject(child);
-      }
-
-      while (
-        pulseGroup.children.length
-      ) {
-        const child =
-          pulseGroup.children.pop();
-
-        disposeObject(child);
-      }
-
-      hitTargets.length = 0;
+      hitTargets.length =
+        SECTION_COUNT;
 
       const selections =
         activeSelections || [];
 
       for (
-        let i = 0;
-        i < SECTION_COUNT;
+        let i = startIndex;
+        i < endIndex;
         i++
       ) {
+        const groups = [
+          sectionWireGroups[i],
+          sectionInteractionGroups[i],
+          sectionPulseGroups[i],
+        ];
+
+        groups.forEach((group) => {
+          while (group.children.length) {
+            const child =
+              group.children[
+                group.children.length - 1
+              ];
+
+            group.remove(child);
+            disposeObject(child);
+          }
+        });
+
         const sectionPath =
           sectionPaths[i];
 
@@ -1955,8 +2082,8 @@ export default function App() {
 
         mesh.castShadow = true;
 
-        wireGroup.add(mesh);
-        hitTargets.push(mesh);
+        sectionWireGroups[i].add(mesh);
+        hitTargets[i] = mesh;
 
         /*
          * Selected-section halo.
@@ -1977,7 +2104,7 @@ export default function App() {
                 }),
               );
 
-            interactionGroup.add(
+            sectionInteractionGroups[i].add(
               halo,
             );
           } else {
@@ -1996,7 +2123,7 @@ export default function App() {
                 }),
               );
 
-            interactionGroup.add(
+            sectionInteractionGroups[i].add(
               halo,
             );
           }
@@ -2048,51 +2175,52 @@ export default function App() {
               -0.16,
             ),
             isWrapped
-              ? 0.22
+              ? 0.42
               : Math.min(
-                  0.42,
-                  SECTION_LENGTH * 0.7,
+                  0.62,
+                  SECTION_LENGTH * 1.1,
                 ),
             isSelected
-              ? 0xffc0ec
-              : 0xffc477,
-            0.12,
-            0.07,
+              ? 0xffd9f4
+              : 0xffd28f,
+            0.20,
+            0.11,
           );
 
         arrow.userData.sectionIndex =
           i;
 
-        interactionGroup.add(
+        sectionInteractionGroups[i].add(
           arrow,
         );
 
         /*
          * Small current markers.
          */
-        [0.3, 0.7].forEach(
-          (t) => {
-            const index =
-              Math.floor(
-                t *
-                  (sectionPath.length -
-                    1),
+        [0].forEach(
+          (_, markerIndex) => {
+            const glowCurve =
+              new THREE.CatmullRomCurve3(
+                sectionPath,
+                false,
+                'centripetal',
               );
 
             const marker =
               new THREE.Mesh(
-                new THREE.SphereGeometry(
-                  0.035,
+                new THREE.TubeGeometry(
+                  glowCurve,
                   8,
+                  0.095,
                   8,
+                  false,
                 ),
                 new THREE.MeshBasicMaterial({
-                  color:
-                    isSelected
-                      ? 0xffe3f6
-                      : 0xffd9ad,
+                  color: 0x9f1d35,
 
                   transparent: true,
+                  depthTest: false,
+                  depthWrite: false,
 
                   opacity:
                     isSelected
@@ -2101,11 +2229,25 @@ export default function App() {
                 }),
               );
 
-            marker.position.copy(
-              sectionPath[index],
-            );
+            marker.renderOrder = 6;
 
-            pulseGroup.add(
+            marker.userData.pulseIndex =
+              i * 2 + markerIndex;
+
+            marker.userData.pulsePhase =
+              (
+                (i + markerIndex * 0.5) /
+                SECTION_COUNT *
+                COIL_TURNS /
+                PULSE_REPEAT_TURNS
+              ) *
+              Math.PI *
+              2;
+
+            marker.userData.baseOpacity =
+              isSelected ? 1 : 0.65;
+
+            sectionPulseGroups[i].add(
               marker,
             );
           },
@@ -2134,6 +2276,7 @@ export default function App() {
         buildCombinedField(
           sectionPaths,
           activeCount,
+          stateRef.current.combinedLineCount,
         );
 
       const allContributions =
@@ -2199,6 +2342,122 @@ export default function App() {
       );
 
       updateFieldBlend();
+    }
+
+    function rebuildContributionSections(
+      sectionPaths,
+      startIndex,
+      endIndex,
+    ) {
+      if (
+        stateRef.current.mode !== 'all'
+      ) {
+        return;
+      }
+
+      const allGroup =
+        fieldGroup.getObjectByName(
+          'allContributionsField',
+        );
+
+      if (!allGroup) {
+        return;
+      }
+
+      for (
+        let sectionIndex = startIndex;
+        sectionIndex < endIndex;
+        sectionIndex++
+      ) {
+        const oldSectionGroup =
+          allGroup.children.find(
+            (child) =>
+              child.userData.sectionIndex ===
+              sectionIndex,
+          );
+
+        if (oldSectionGroup) {
+          allGroup.remove(
+            oldSectionGroup,
+          );
+
+          disposeObject(
+            oldSectionGroup,
+          );
+        }
+
+        const replacementRoot =
+          buildAllContributionsField(
+            sectionPaths,
+            SECTION_COUNT,
+            [sectionIndex],
+          );
+
+        const replacement =
+          replacementRoot.children[0];
+
+        replacementRoot.remove(
+          replacement,
+        );
+
+        replacement.traverse((obj) => {
+          if (
+            obj.material &&
+            'opacity' in obj.material
+          ) {
+            obj.material.userData = {
+              ...(
+                obj.material.userData || {}
+              ),
+              fieldMode:
+                'allContributionsField',
+              baseOpacity:
+                obj.material.opacity,
+            };
+
+            obj.material.opacity *=
+              state.fieldBlend;
+          }
+        });
+
+        allGroup.add(replacement);
+      }
+    }
+
+    function translateContributionSections(
+      startIndex,
+      endIndex,
+      deltaX,
+    ) {
+      if (
+        stateRef.current.mode !== 'all'
+      ) {
+        return;
+      }
+
+      const allGroup =
+        fieldGroup.getObjectByName(
+          'allContributionsField',
+        );
+
+      if (!allGroup) {
+        return;
+      }
+
+      allGroup.children.forEach(
+        (sectionGroup) => {
+          const sectionIndex =
+            sectionGroup.userData.sectionIndex;
+
+          if (
+            sectionIndex >= startIndex &&
+            sectionIndex < endIndex
+          ) {
+            sectionGroup.position.x +=
+              deltaX;
+          }
+        },
+      );
     }
 
     function updateFieldBlend() {
@@ -2341,6 +2600,14 @@ export default function App() {
 
       animationTo =
         toCount;
+
+      tailPullFrom =
+        state.tailPull;
+
+      tailPullTo =
+        toCount *
+        SECTION_LENGTH *
+        TAIL_PULL_RATIO;
     }
 
     function handleWrapNext() {
@@ -2401,6 +2668,7 @@ export default function App() {
       }
 
       beginWrap(clamped);
+      setWrappedCount(clamped);
     }
 
     function handlePitchChange(
@@ -2416,9 +2684,28 @@ export default function App() {
             .wrappedCount,
           1,
           pitch,
+          state.tailPull,
         );
 
       rebuildAll(paths);
+    }
+
+    function handleCombinedLineCountChange(
+      count,
+    ) {
+      const nextCount = Math.max(
+        1,
+        Math.round(count),
+      );
+
+      stateRef.current.combinedLineCount =
+        nextCount;
+
+      rebuildFields(
+        state.sectionPaths,
+        stateRef.current.wrappedCount,
+        stateRef.current.selectedSections,
+      );
     }
 
     function handleCombined() {
@@ -2441,6 +2728,37 @@ export default function App() {
         [];
 
       state.fieldBlendTarget = 1;
+
+      rebuildFields(
+        state.sectionPaths,
+        stateRef.current
+          .wrappedCount,
+        [],
+      );
+
+      rebuildWire(
+        state.sectionPaths,
+        stateRef.current
+          .wrappedCount,
+        [],
+      );
+    }
+
+    /*
+     * Hide every field visualization while keeping
+     * the wire and all other controls unchanged.
+     */
+    function handleNoField() {
+      setMode('none');
+      setSelectedSections([]);
+
+      stateRef.current.mode =
+        'none';
+
+      stateRef.current.selectedSections =
+        [];
+
+      state.fieldBlendTarget = 0;
 
       rebuildFields(
         state.sectionPaths,
@@ -2493,9 +2811,7 @@ export default function App() {
         next = [
           ...current,
           index,
-        ].slice(
-          -MAX_SELECTED_SECTIONS,
-        );
+        ];
       }
 
       const nextMode =
@@ -2532,9 +2848,59 @@ export default function App() {
       );
     }
 
-    function onPointerDown(
-      event,
-    ) {
+    function clearSectionSelection() {
+      if (
+        !stateRef.current.selectedSections.length
+      ) {
+        return;
+      }
+
+      setSelectedSections([]);
+      setMode('combined');
+
+      stateRef.current.selectedSections = [];
+      stateRef.current.mode = 'combined';
+      state.fieldBlendTarget = 1;
+
+      rebuildFields(
+        state.sectionPaths,
+        stateRef.current.wrappedCount,
+        [],
+      );
+
+      rebuildWire(
+        state.sectionPaths,
+        stateRef.current.wrappedCount,
+        [],
+      );
+    }
+
+    let sectionPointerDown = null;
+
+    function onPointerDown(event) {
+      sectionPointerDown = {
+        pointerId: event.pointerId,
+        clientX: event.clientX,
+        clientY: event.clientY,
+        shiftKey: event.shiftKey,
+      };
+    }
+
+    function onPointerUp(event) {
+      const pointerDown = sectionPointerDown;
+      sectionPointerDown = null;
+
+      if (
+        !pointerDown ||
+        pointerDown.pointerId !== event.pointerId ||
+        Math.hypot(
+          event.clientX - pointerDown.clientX,
+          event.clientY - pointerDown.clientY,
+        ) > 5
+      ) {
+        return;
+      }
+
       const rect =
         renderer.domElement.getBoundingClientRect();
 
@@ -2568,6 +2934,7 @@ export default function App() {
       if (
         !intersections.length
       ) {
+        clearSectionSelection();
         return;
       }
 
@@ -2581,14 +2948,40 @@ export default function App() {
       ) {
         handleSelectSection(
           index,
-          event.shiftKey,
+          pointerDown.shiftKey,
         );
+      }
+    }
+
+    function onPointerCancel() {
+      sectionPointerDown = null;
+    }
+
+    function onKeyDown(event) {
+      if (
+        event.key === 'Escape' &&
+        stateRef.current.selectedSections.length
+      ) {
+        event.preventDefault();
+        clearSectionSelection();
       }
     }
 
     renderer.domElement.addEventListener(
       'pointerdown',
       onPointerDown,
+    );
+    renderer.domElement.addEventListener(
+      'pointerup',
+      onPointerUp,
+    );
+    renderer.domElement.addEventListener(
+      'pointercancel',
+      onPointerCancel,
+    );
+    window.addEventListener(
+      'keydown',
+      onKeyDown,
     );
 
     function resize() {
@@ -2633,7 +3026,7 @@ export default function App() {
           animate,
         );
 
-      if (animationKind) {
+      if (animationKind === 'wrap') {
         const elapsed =
           Math.min(
             (now -
@@ -2647,12 +3040,26 @@ export default function App() {
           elapsed *
           (3 - 2 * elapsed);
 
+        const previousTailPull =
+          state.tailPull;
+
+        state.tailPull =
+          THREE.MathUtils.lerp(
+            tailPullFrom,
+            tailPullTo,
+            eased,
+          );
+
         const paths =
           getAnimatedSectionPaths(
             animationFrom,
             animationTo,
             eased,
             coilPitchRef.current,
+            animationTo > animationFrom
+              ? state.sectionPaths
+              : undefined,
+            state.tailPull,
           );
 
         const fieldCount =
@@ -2669,26 +3076,40 @@ export default function App() {
           fieldCount,
           stateRef.current
             .selectedSections,
+          {
+            start: Math.min(
+              animationFrom,
+              animationTo,
+            ),
+            end: SECTION_COUNT,
+          },
         );
 
-        rebuildFields(
+        translateContributionSections(
+          Math.max(
+            animationFrom,
+            animationTo,
+          ),
+          SECTION_COUNT,
+          previousTailPull -
+            state.tailPull,
+        );
+
+        rebuildContributionSections(
           paths,
-          fieldCount,
-          stateRef.current
-            .selectedSections,
+          Math.min(
+            animationFrom,
+            animationTo,
+          ),
+          Math.max(
+            animationFrom,
+            animationTo,
+          ),
         );
 
-        state.sectionPaths =
-          paths.map(
-            (path) =>
-              path.map((p) =>
-                p.clone(),
-              ),
-          );
+        state.sectionPaths = paths;
 
         if (elapsed >= 1) {
-          animationKind = null;
-
           setWrappedCount(
             animationTo,
           );
@@ -2733,11 +3154,14 @@ export default function App() {
               animationTo,
               1,
               coilPitchRef.current,
+              state.tailPull,
             );
 
           rebuildAll(
             finalPaths,
           );
+
+          animationKind = null;
         }
       }
 
@@ -2751,16 +3175,35 @@ export default function App() {
 
       updateFieldBlend();
 
-      pulseGroup.children.forEach(
-        (marker, index) => {
-          marker.scale.setScalar(
-            0.88 +
-              Math.sin(
-                now * 0.004 +
-                  index,
-              ) *
-                0.12,
-          );
+      pulseGroup.traverse(
+        (marker) => {
+          if (!marker.isMesh) {
+            return;
+          }
+
+          const pulsePosition =
+            (
+              now * 0.0022 -
+              marker.userData.pulsePhase
+            ) %
+            (Math.PI * 2);
+
+          const pulseWidth =
+            0.9;
+
+          const pulseStrength =
+            pulsePosition < 0 ||
+            pulsePosition >= pulseWidth
+              ? 0
+              : 1 -
+                pulsePosition /
+                  pulseWidth;
+
+          if (marker.material) {
+            marker.material.opacity =
+              marker.userData.baseOpacity *
+              pulseStrength;
+          }
         },
       );
 
@@ -2778,6 +3221,11 @@ export default function App() {
       );
 
     mount._magneticTool = {
+      showCurrent:
+        (visible) => {
+          pulseGroup.visible = visible;
+        },
+
       wrapNext:
         handleWrapNext,
 
@@ -2790,11 +3238,17 @@ export default function App() {
       allContributions:
         handleAllContributions,
 
+      noField:
+        handleNoField,
+
       jumpTo:
         handleJumpTo,
 
       pitchChange:
         handlePitchChange,
+
+      combinedLineCountChange:
+        handleCombinedLineCountChange,
     };
 
     return () => {
@@ -2808,12 +3262,25 @@ export default function App() {
         'pointerdown',
         onPointerDown,
       );
+      renderer.domElement.removeEventListener(
+        'pointerup',
+        onPointerUp,
+      );
+      renderer.domElement.removeEventListener(
+        'pointercancel',
+        onPointerCancel,
+      );
+      window.removeEventListener(
+        'keydown',
+        onKeyDown,
+      );
 
       controls.dispose();
 
       disposeObject(scene);
 
       renderer.dispose();
+      renderer.forceContextLoss();
 
       renderer.domElement.remove();
 
@@ -2834,6 +3301,17 @@ export default function App() {
   const triggerUndo = () =>
     mountRef.current?._magneticTool?.undo();
 
+  const handleCurrentToggle =
+    (event) => {
+      const visible =
+        event.target.checked;
+
+      setShowCurrent(visible);
+
+      mountRef.current?._magneticTool
+        ?.showCurrent(visible);
+    };
+
   const triggerCombined = () => {
     setMode('combined');
     setSelectedSections([]);
@@ -2850,6 +3328,14 @@ export default function App() {
         ?.allContributions();
     };
 
+  const triggerNoField = () => {
+    setMode('none');
+    setSelectedSections([]);
+
+    mountRef.current?._magneticTool
+      ?.noField();
+  };
+
   const handlePitchSliderChange =
     (event) => {
       const value =
@@ -2859,6 +3345,17 @@ export default function App() {
 
       mountRef.current?._magneticTool
         ?.pitchChange(value);
+    };
+
+  const handleCombinedLineCountChange =
+    (event) => {
+      const value =
+        Number(event.target.value);
+
+      setCombinedLineCount(value);
+
+      mountRef.current?._magneticTool
+        ?.combinedLineCountChange(value);
     };
 
   const jumpToFractionOfBar = (
@@ -2923,9 +3420,10 @@ export default function App() {
         }
 
         .magnetic-app {
-          min-height: 100vh;
+          width: 100%;
+          min-height: 100svh;
           margin: 0;
-          padding: 20px;
+          padding: 16px;
           display: grid;
           place-items: center;
           background:
@@ -2953,12 +3451,15 @@ export default function App() {
 
         .magnetic-panel {
           position: relative;
-          width: min(1180px, 100%);
+          width: min(1600px, 100%);
           height: min(
-            760px,
-            calc(100vh - 40px)
+            960px,
+            calc(100svh - 32px)
           );
-          min-height: 620px;
+          min-height: min(
+            640px,
+            calc(100svh - 32px)
+          );
           overflow: hidden;
           border: 1px solid
             rgba(145, 211, 239, 0.15);
@@ -3035,10 +3536,45 @@ export default function App() {
           right: 20px;
           pointer-events: auto;
           display: flex;
+          flex-direction: column;
+          align-items: flex-end;
+          gap: 8px;
+          justify-content: flex-start;
+          max-width: none;
+        }
+
+        .button-row {
+          display: flex;
+          align-items: center;
           gap: 8px;
           flex-wrap: wrap;
           justify-content: flex-end;
-          max-width: 480px;
+        }
+
+        .current-toggle {
+          display: inline-flex;
+          align-items: center;
+          gap: 7px;
+          padding: 9px 12px;
+          border: 1px solid rgba(255, 106, 91, 0.42);
+          border-radius: 12px;
+          background: rgba(46, 15, 18, 0.82);
+          color: #ffd5cf;
+          font-size: 12px;
+          font-weight: 800;
+          white-space: nowrap;
+          cursor: pointer;
+        }
+
+        .current-toggle input {
+          accent-color: #d8333e;
+          width: 15px;
+          height: 15px;
+          margin: 0;
+        }
+
+        .slider-control {
+          width: 240px;
         }
 
         .control {
@@ -3052,6 +3588,7 @@ export default function App() {
           padding: 9px 12px;
           font-weight: 700;
           font-size: 12px;
+          white-space: nowrap;
           cursor: pointer;
           transition:
             transform .15s ease,
@@ -3351,6 +3888,33 @@ export default function App() {
           line-height: 1.4;
         }
 
+        .webgl-fallback {
+          position: absolute;
+          inset: 0;
+          z-index: 5;
+          display: grid;
+          place-content: center;
+          gap: 8px;
+          padding: 24px;
+          background: rgba(3, 9, 16, 0.94);
+          color: #edf9ff;
+          text-align: center;
+        }
+
+        .webgl-fallback[hidden] {
+          display: none;
+        }
+
+        .webgl-fallback strong {
+          font-size: 18px;
+        }
+
+        .webgl-fallback span {
+          max-width: 420px;
+          color: #a8c5d3;
+          font-size: 14px;
+        }
+
         @media (max-width: 1000px) {
           .top-right {
             max-width: 430px;
@@ -3374,11 +3938,26 @@ export default function App() {
           }
 
           .top-right {
-            max-width: 340px;
+            top: 122px;
+            left: 18px;
+            right: 18px;
+            max-width: none;
+            align-items: flex-start;
+          }
+
+          .button-row {
+            justify-content: flex-start;
+          }
+
+          .slider-control {
+            width: min(280px, 100%);
           }
 
           .help {
-            top: 140px;
+            top: 270px;
+            left: 18px;
+            right: 18px;
+            max-width: none;
           }
         }
 
@@ -3392,15 +3971,11 @@ export default function App() {
           }
 
           .top-right {
-            top: 70px;
-            left: 18px;
-            right: 18px;
-            justify-content: flex-start;
+            top: 122px;
           }
 
           .help {
-            top: 158px;
-            max-width: 250px;
+            top: 270px;
           }
 
           .field-legend {
@@ -3414,6 +3989,18 @@ export default function App() {
       `}</style>
 
       <div className="magnetic-panel">
+        <div
+          ref={webglFallbackRef}
+          className="webgl-fallback"
+          hidden
+          role="alert"
+        >
+          <strong>3D view unavailable</strong>
+          <span>
+            This browser could not create a WebGL context. Try enabling hardware acceleration or using another browser or device.
+          </span>
+        </div>
+
         <div
           ref={mountRef}
           className="three-stage"
@@ -3431,45 +4018,62 @@ export default function App() {
         </div>
 
         <div className="hud top-right">
+          <div className="button-row">
+            <label className="current-toggle">
+              <input
+                type="checkbox"
+                checked={showCurrent}
+                onChange={handleCurrentToggle}
+              />
+              <span>Show current</span>
+            </label>
 
-          <button
-            className="control"
-            onClick={triggerUndo}
-            disabled={!canUndo}
-          >
-            Unwrap
-          </button>
+            <button
+              className="control"
+              onClick={triggerUndo}
+              disabled={!canUndo}
+            >
+              Unwrap
+            </button>
 
-          <button
-            className="control primary"
-            onClick={triggerWrap}
-            disabled={!canWrap}
-          >
-            Wrap
-          </button>
+            <button
+              className="control primary"
+              onClick={triggerWrap}
+              disabled={!canWrap}
+            >
+              Wrap
+            </button>
 
-          <button
-            className="control"
-            onClick={triggerCombined}
-          >
-            Combined field
-          </button>
+            <button
+              className="control"
+              onClick={triggerNoField}
+            >
+              No field
+            </button>
 
-          <button
-            className="control multicolor"
-            onClick={
-              triggerAllContributions
-            }
-          >
-            Contributions to field
-          </button>
+            <button
+              className="control"
+              onClick={triggerCombined}
+            >
+              Combined field
+            </button>
+
+            <button
+              className="control multicolor"
+              onClick={
+                triggerAllContributions
+              }
+            >
+              Contributions to field
+            </button>
+          </div>
 
           <label
+            className="slider-control"
             style={{
               display: 'flex',
               flexDirection: 'column',
               gap: 6,
-              marginTop: 10,
             }}
           >
             <span>
@@ -3494,14 +4098,40 @@ export default function App() {
             />
           </label>
 
+          <label
+            className="slider-control"
+            style={{
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 6,
+            }}
+          >
+            <span>
+              Combined field lines: {combinedLineCount}
+            </span>
+
+            <input
+              type="range"
+              min="4"
+              max="36"
+              step="2"
+              value={combinedLineCount}
+              onChange={
+                handleCombinedLineCountChange
+              }
+              disabled={mode !== 'combined'}
+              aria-label="Number of combined field lines"
+            />
+          </label>
+
         </div>
 
         <div className="help">
           Drag = orbit · Wheel = zoom ·
           Right-drag = pan · Click a
           wrapped section = isolate its
-          field · Shift+click a second
-          section = compare two fields ·
+          field · Shift+click sections to
+          compare their fields ·
           Click or drag the progress bar
           to jump to a section count
         </div>
@@ -3560,22 +4190,18 @@ export default function App() {
             'Blue field lines show the superposed field from every wrapped section.'}
 
           {mode === 'all' &&
-            'Every wrapped section has its own independently rendered, color-coded field.'}
+            'Every section has its own independently rendered, color-coded field.'}
 
           {mode === 'individual' &&
-            (selectedSections.length ===
-            2
-              ? `Sections ${
-                  selectedSections[0] +
-                  1
-                } & ${
-                  selectedSections[1] +
-                  1
-                } are isolated — pink field lines show their combined contribution.`
+            (selectedSections.length > 1
+              ? `${selectedSections.length} sections are isolated — pink field lines show their combined contribution.`
               : `Section ${
                   (selectedSections[0] ??
                     0) + 1
                 } is isolated — pink field lines show only its contribution.`)}
+
+          {mode === 'none' &&
+            'The magnetic field visualization is hidden.'}
         </div>
         
         <div style={{ marginTop: 10 }}>
