@@ -21,7 +21,7 @@ const SECTION_LENGTH = 0.52;
 const TAIL_PULL_RATIO = 0.75;
 
 const COIL_RADIUS = 1.75;
-const COIL_PITCH = 0.2;
+const COIL_PITCH = 0.1;
 const COIL_TURNS = 6.5;
 const PULSE_REPEAT_TURNS = 3;
 
@@ -1578,6 +1578,39 @@ function buildSectionField(
   return group;
 }
 
+const DIRECTION_ARROW_PATHS = {
+  up: 'M12 19 V5 M7 10 L12 5 L17 10',
+  right: 'M5 12 H19 M14 7 L19 12 L14 17',
+  down: 'M12 5 V19 M7 14 L12 19 L17 14',
+  left: 'M19 12 H5 M10 7 L5 12 L10 17',
+};
+
+function DirectionArrow({ direction }) {
+  const path =
+    DIRECTION_ARROW_PATHS[direction];
+
+  return (
+    <svg
+      className="direction-arrow"
+      viewBox="0 0 24 24"
+      aria-hidden="true"
+    >
+      <path
+        className="direction-arrow-shadow"
+        d={path}
+      />
+      <path
+        className="direction-arrow-face"
+        d={path}
+      />
+      <path
+        className="direction-arrow-highlight"
+        d={path}
+      />
+    </svg>
+  );
+}
+
 function FieldLegend({
   selectedSections,
   wrappedCount,
@@ -1677,6 +1710,9 @@ export default function App() {
 
   const [showCurrent, setShowCurrent] =
     useState(true);
+
+  const [showPoles, setShowPoles] =
+    useState(false);
 
   const stateRef =
     useRef({
@@ -1896,12 +1932,95 @@ export default function App() {
     const pulseGroup =
       new THREE.Group();
 
+    const poleGroup =
+      new THREE.Group();
+
     root.add(fieldGroup);
     root.add(wireGroup);
     root.add(
       interactionGroup,
     );
     root.add(pulseGroup);
+    root.add(poleGroup);
+
+    function createPoleLabel(
+      text,
+      color,
+    ) {
+      const canvas =
+        document.createElement('canvas');
+
+      canvas.width = 320;
+      canvas.height = 96;
+
+      const context =
+        canvas.getContext('2d');
+
+      context.font =
+        '700 32px sans-serif';
+      context.textAlign = 'center';
+      context.textBaseline = 'middle';
+      context.fillStyle = color;
+      context.fillText(
+        text,
+        canvas.width / 2,
+        canvas.height / 2,
+      );
+
+      const texture =
+        new THREE.CanvasTexture(canvas);
+
+      const label =
+        new THREE.Sprite(
+          new THREE.SpriteMaterial({
+            map: texture,
+            transparent: true,
+            depthTest: false,
+          }),
+        );
+
+      label.scale.set(1.35, 0.4, 1);
+      label.renderOrder = 7;
+      poleGroup.add(label);
+      return label;
+    }
+
+    const poleMarkers = [
+      {
+        color: 0xff5c70,
+        label: createPoleLabel(
+          'north',
+          '#ff9aa6',
+        ),
+      },
+      {
+        color: 0x4da6ff,
+        label: createPoleLabel(
+          'south',
+          '#8bc9ff',
+        ),
+      },
+    ].map(({ color, label }) => {
+      const marker =
+        new THREE.Mesh(
+          new THREE.SphereGeometry(
+            0.52,
+            16,
+            12,
+          ),
+          new THREE.MeshBasicMaterial({
+            color,
+            transparent: true,
+            opacity: 0.92,
+          }),
+        );
+
+      poleGroup.add(marker);
+      marker.userData.label = label;
+      return marker;
+    });
+
+    poleGroup.visible = false;
 
     const sectionWireGroups =
       Array.from(
@@ -1943,6 +2062,13 @@ export default function App() {
     let animationFrame = 0;
     let animationStart = 0;
     let animationKind = null;
+    let panMotion = null;
+    let previousFrameTime = 0;
+    let shiftHeld = false;
+    let orbitMotion = null;
+    const heldArrows = new Set();
+    const heldPanButtons = new Set();
+    const heldOrbitButtons = new Set();
     let animationFrom = 0;
     let animationTo = 0;
     let tailPullFrom = 0;
@@ -1984,6 +2110,61 @@ export default function App() {
 
       hitTargets.length =
         SECTION_COUNT;
+
+      const firstPath =
+        sectionPaths[0];
+
+      const lastPath =
+        sectionPaths[SECTION_COUNT - 1];
+
+      const lastWrappedPath =
+        sectionPaths[
+          Math.max(
+            0,
+            currentWrappedCount - 1,
+          )
+        ];
+
+      if (
+        firstPath &&
+        lastPath &&
+        lastWrappedPath
+      ) {
+        const firstEndpoint =
+          firstPath[0];
+
+        const lastEndpoint =
+          lastPath[lastPath.length - 1];
+
+        const lastWrappedEndpoint =
+          lastWrappedPath[
+            lastWrappedPath.length - 1
+          ];
+
+        const axisCenter =
+          new THREE.Vector3()
+            .addVectors(
+              firstEndpoint,
+              lastEndpoint,
+            )
+            .multiplyScalar(0.5);
+
+        poleMarkers[1].position.set(
+          firstEndpoint.x - 0.55,
+          axisCenter.y,
+          axisCenter.z + 3.2,
+        );
+        poleMarkers[0].position.set(
+          lastWrappedEndpoint.x + 0.55,
+          axisCenter.y,
+          axisCenter.z + 3.2,
+        );
+
+        poleMarkers[0].userData.label.position
+          .copy(poleMarkers[0].position);
+        poleMarkers[1].userData.label.position
+          .copy(poleMarkers[1].position);
+      }
 
       const selections =
         activeSelections || [];
@@ -2957,7 +3138,133 @@ export default function App() {
       sectionPointerDown = null;
     }
 
+    function pan(direction) {
+      camera.updateMatrixWorld();
+
+      const right =
+        new THREE.Vector3()
+          .setFromMatrixColumn(
+            camera.matrixWorld,
+            0,
+          )
+          .normalize();
+
+      const up =
+        new THREE.Vector3()
+          .setFromMatrixColumn(
+            camera.matrixWorld,
+            1,
+          )
+          .normalize();
+
+      const distance =
+        camera.position.distanceTo(
+          controls.target,
+        );
+
+      const step =
+        distance * 0.035;
+
+      let offset;
+
+      if (direction === 'left') {
+        offset = right.negate();
+      } else if (direction === 'right') {
+        offset = right;
+      } else if (direction === 'up') {
+        offset = up;
+      } else if (direction === 'down') {
+        offset = up.negate();
+      } else {
+        return;
+      }
+
+      offset.multiplyScalar(step);
+
+      panMotion = {
+        startTime: performance.now(),
+        startCamera: camera.position.clone(),
+        endCamera: camera.position.clone().add(offset),
+        startTarget: controls.target.clone(),
+        endTarget: controls.target.clone().add(offset),
+      };
+    }
+
+    function orbit(direction) {
+      const spherical =
+        new THREE.Spherical().setFromVector3(
+          camera.position.clone().sub(
+            controls.target,
+          ),
+        );
+
+      const end = spherical.clone();
+      const angle = 0.12;
+
+      if (direction === 'left') {
+        end.theta -= angle;
+      } else if (direction === 'right') {
+        end.theta += angle;
+      } else if (direction === 'up') {
+        end.phi -= angle;
+      } else if (direction === 'down') {
+        end.phi += angle;
+      } else {
+        return;
+      }
+
+      end.phi = THREE.MathUtils.clamp(
+        end.phi,
+        Math.max(0.03, controls.minPolarAngle),
+        Math.min(
+          Math.PI - 0.03,
+          controls.maxPolarAngle,
+        ),
+      );
+
+      orbitMotion = {
+        startTime: performance.now(),
+        radius: spherical.radius,
+        startTheta: spherical.theta,
+        endTheta: end.theta,
+        startPhi: spherical.phi,
+        endPhi: end.phi,
+      };
+      panMotion = null;
+    }
+
     function onKeyDown(event) {
+      const target = event.target;
+
+      if (
+        target instanceof HTMLElement &&
+        (
+          target.isContentEditable ||
+          target.matches(
+            'input, textarea, select',
+          )
+        )
+      ) {
+        return;
+      }
+
+      if (event.key === 'Shift') {
+        shiftHeld = true;
+      }
+
+      const panDirections = {
+        ArrowLeft: 'left',
+        ArrowRight: 'right',
+        ArrowUp: 'up',
+        ArrowDown: 'down',
+      };
+
+      if (panDirections[event.key]) {
+        event.preventDefault();
+        heldArrows.add(event.key);
+        shiftHeld = event.shiftKey;
+      }
+
       if (
         event.key === 'Escape' &&
         stateRef.current.selectedSections.length
@@ -2965,6 +3272,23 @@ export default function App() {
         event.preventDefault();
         clearSectionSelection();
       }
+    }
+
+    function onKeyUp(event) {
+      if (event.key === 'Shift') {
+        shiftHeld = false;
+        return;
+      }
+
+      heldArrows.delete(event.key);
+      shiftHeld = event.shiftKey;
+    }
+
+    function stopHeldMotion() {
+      heldArrows.clear();
+      heldPanButtons.clear();
+      heldOrbitButtons.clear();
+      shiftHeld = false;
     }
 
     renderer.domElement.addEventListener(
@@ -2982,6 +3306,14 @@ export default function App() {
     window.addEventListener(
       'keydown',
       onKeyDown,
+    );
+    window.addEventListener(
+      'keyup',
+      onKeyUp,
+    );
+    window.addEventListener(
+      'blur',
+      stopHeldMotion,
     );
 
     function resize() {
@@ -3025,6 +3357,215 @@ export default function App() {
         requestAnimationFrame(
           animate,
         );
+
+      const deltaSeconds =
+        previousFrameTime
+          ? Math.min(
+              (now - previousFrameTime) / 1000,
+              0.05,
+            )
+          : 0;
+
+      previousFrameTime = now;
+
+      if (
+        deltaSeconds > 0 &&
+        (
+          heldArrows.size ||
+          heldPanButtons.size ||
+          heldOrbitButtons.size
+        )
+      ) {
+        orbitMotion = null;
+        camera.updateMatrixWorld();
+
+        const right =
+          new THREE.Vector3()
+            .setFromMatrixColumn(
+              camera.matrixWorld,
+              0,
+            )
+            .normalize();
+
+        const up =
+          new THREE.Vector3()
+            .setFromMatrixColumn(
+              camera.matrixWorld,
+              1,
+            )
+            .normalize();
+
+        const panOffset =
+          new THREE.Vector3();
+        let orbitHorizontal = 0;
+        let orbitVertical = 0;
+
+        heldArrows.forEach((key) => {
+          const direction =
+            key === 'ArrowLeft'
+              ? 'left'
+              : key === 'ArrowRight'
+                ? 'right'
+                : key === 'ArrowUp'
+                  ? 'up'
+                  : 'down';
+
+          if (shiftHeld) {
+            if (direction === 'left') {
+              orbitHorizontal -= 1;
+            } else if (direction === 'right') {
+              orbitHorizontal += 1;
+            } else if (direction === 'up') {
+              orbitVertical -= 1;
+            } else {
+              orbitVertical += 1;
+            }
+          } else if (direction === 'left') {
+            panOffset.addScaledVector(right, -1);
+          } else if (direction === 'right') {
+            panOffset.add(right);
+          } else if (direction === 'up') {
+            panOffset.add(up);
+          } else {
+            panOffset.addScaledVector(up, -1);
+          }
+        });
+
+        heldPanButtons.forEach((direction) => {
+          if (direction === 'left') {
+            panOffset.addScaledVector(right, -1);
+          } else if (direction === 'right') {
+            panOffset.add(right);
+          } else if (direction === 'up') {
+            panOffset.add(up);
+          } else if (direction === 'down') {
+            panOffset.addScaledVector(up, -1);
+          }
+        });
+
+        heldOrbitButtons.forEach((direction) => {
+          if (direction === 'left') {
+            orbitHorizontal -= 1;
+          } else if (direction === 'right') {
+            orbitHorizontal += 1;
+          } else if (direction === 'up') {
+            orbitVertical -= 1;
+          } else if (direction === 'down') {
+            orbitVertical += 1;
+          }
+        });
+
+        if (panOffset.lengthSq() > 0) {
+          panOffset.normalize().multiplyScalar(
+            camera.position.distanceTo(
+              controls.target,
+            ) *
+              0.35 *
+              deltaSeconds,
+          );
+          camera.position.add(panOffset);
+          controls.target.add(panOffset);
+          panMotion = null;
+        }
+
+        if (orbitHorizontal || orbitVertical) {
+          const spherical =
+            new THREE.Spherical().setFromVector3(
+              camera.position.clone().sub(
+                controls.target,
+              ),
+            );
+
+          spherical.theta +=
+            orbitHorizontal * 0.55 * deltaSeconds;
+          spherical.phi =
+            THREE.MathUtils.clamp(
+              spherical.phi +
+                orbitVertical * 0.55 * deltaSeconds,
+              Math.max(0.03, controls.minPolarAngle),
+              Math.min(
+                Math.PI - 0.03,
+                controls.maxPolarAngle,
+              ),
+            );
+
+          camera.position
+            .copy(controls.target)
+            .add(
+              new THREE.Vector3()
+                .setFromSpherical(spherical),
+            );
+          panMotion = null;
+        }
+      }
+
+      if (panMotion) {
+        const elapsed =
+          Math.min(
+            (now - panMotion.startTime) / 220,
+            1,
+          );
+
+        const eased =
+          elapsed *
+          elapsed *
+          (3 - 2 * elapsed);
+
+        camera.position.lerpVectors(
+          panMotion.startCamera,
+          panMotion.endCamera,
+          eased,
+        );
+
+        controls.target.lerpVectors(
+          panMotion.startTarget,
+          panMotion.endTarget,
+          eased,
+        );
+
+        if (elapsed >= 1) {
+          panMotion = null;
+        }
+      }
+
+      if (orbitMotion) {
+        const elapsed =
+          Math.min(
+            (now - orbitMotion.startTime) / 220,
+            1,
+          );
+
+        const eased =
+          elapsed *
+          elapsed *
+          (3 - 2 * elapsed);
+
+        const spherical =
+          new THREE.Spherical(
+            orbitMotion.radius,
+            THREE.MathUtils.lerp(
+              orbitMotion.startPhi,
+              orbitMotion.endPhi,
+              eased,
+            ),
+            THREE.MathUtils.lerp(
+              orbitMotion.startTheta,
+              orbitMotion.endTheta,
+              eased,
+            ),
+          );
+
+        camera.position
+          .copy(controls.target)
+          .add(
+            new THREE.Vector3()
+              .setFromSpherical(spherical),
+          );
+
+        if (elapsed >= 1) {
+          orbitMotion = null;
+        }
+      }
 
       if (animationKind === 'wrap') {
         const elapsed =
@@ -3226,6 +3767,11 @@ export default function App() {
           pulseGroup.visible = visible;
         },
 
+      showPoles:
+        (visible) => {
+          poleGroup.visible = visible;
+        },
+
       wrapNext:
         handleWrapNext,
 
@@ -3243,6 +3789,31 @@ export default function App() {
 
       jumpTo:
         handleJumpTo,
+
+      pan,
+
+      holdPan:
+        (direction, held) => {
+          if (held) {
+            heldPanButtons.add(direction);
+            panMotion = null;
+          } else {
+            heldPanButtons.delete(direction);
+          }
+        },
+
+      orbit,
+
+      holdOrbit:
+        (direction, held) => {
+          if (held) {
+            heldOrbitButtons.add(direction);
+            orbitMotion = null;
+            panMotion = null;
+          } else {
+            heldOrbitButtons.delete(direction);
+          }
+        },
 
       pitchChange:
         handlePitchChange,
@@ -3274,6 +3845,14 @@ export default function App() {
         'keydown',
         onKeyDown,
       );
+      window.removeEventListener(
+        'keyup',
+        onKeyUp,
+      );
+      window.removeEventListener(
+        'blur',
+        stopHeldMotion,
+      );
 
       controls.dispose();
 
@@ -3301,6 +3880,26 @@ export default function App() {
   const triggerUndo = () =>
     mountRef.current?._magneticTool?.undo();
 
+  const triggerPan = (direction) =>
+    mountRef.current?._magneticTool?.pan(direction);
+
+  const triggerPanHold = (direction, held) =>
+    mountRef.current?._magneticTool?.holdPan(
+      direction,
+      held,
+    );
+
+  const triggerOrbit = (direction) =>
+    mountRef.current?._magneticTool?.orbit(
+      direction,
+    );
+
+  const triggerOrbitHold = (direction, held) =>
+    mountRef.current?._magneticTool?.holdOrbit(
+      direction,
+      held,
+    );
+
   const handleCurrentToggle =
     (event) => {
       const visible =
@@ -3310,6 +3909,17 @@ export default function App() {
 
       mountRef.current?._magneticTool
         ?.showCurrent(visible);
+    };
+
+  const handlePolesToggle =
+    (event) => {
+      const visible =
+        event.target.checked;
+
+      setShowPoles(visible);
+
+      mountRef.current?._magneticTool
+        ?.showPoles(visible);
     };
 
   const triggerCombined = () => {
@@ -3616,6 +4226,32 @@ export default function App() {
             );
         }
 
+        .control.active {
+          border-color: #62e6ff;
+          background:
+            rgba(
+              23,
+              83,
+              105,
+              0.95
+            );
+          box-shadow:
+            0 0 0 2px
+              rgba(
+                98,
+                230,
+                255,
+                0.18
+              ),
+            0 0 18px
+              rgba(
+                98,
+                230,
+                255,
+                0.18
+              );
+        }
+
         .control:disabled {
           opacity: 0.34;
           cursor: default;
@@ -3781,7 +4417,7 @@ export default function App() {
           position: absolute;
           left: 22px;
           right: 22px;
-          bottom: 72px;
+          bottom: 92px;
           z-index: 4;
           pointer-events: none;
         }
@@ -3888,6 +4524,194 @@ export default function App() {
           line-height: 1.4;
         }
 
+        .direction-controls {
+          position: absolute;
+          right: 22px;
+          bottom: 150px;
+          z-index: 5;
+          display: flex;
+          align-items: flex-end;
+          gap: 14px;
+          pointer-events: auto;
+        }
+
+        .direction-group {
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          gap: 6px;
+        }
+
+        .direction-label {
+          color: #9cb9c8;
+          font-size: 10px;
+          font-weight: 800;
+          letter-spacing: 0.08em;
+          line-height: 1;
+          text-transform: uppercase;
+        }
+
+        .direction-pad {
+          display: grid;
+          grid-template-columns: repeat(3, 40px);
+          grid-template-rows: repeat(4, 40px);
+          gap: 4px;
+        }
+
+        .pan-button {
+          display: grid;
+          place-items: center;
+          width: 40px;
+          height: 40px;
+          padding: 0;
+          border: 1px solid rgba(147, 212, 240, 0.24);
+          border-radius: 9px;
+          background: rgba(8, 20, 30, 0.82);
+          backdrop-filter: blur(10px);
+          color: #eaf8ff;
+          font-size: 20px;
+          line-height: 1;
+          cursor: pointer;
+          touch-action: manipulation;
+          transition:
+            background .15s ease,
+            border-color .15s ease,
+            transform .15s ease;
+        }
+
+        .pan-button:hover {
+          transform: translateY(-1px);
+          border-color: rgba(127, 197, 229, 0.62);
+          background: rgba(23, 83, 105, 0.95);
+        }
+
+        .orbit-button {
+          border-color: rgba(255, 181, 92, 0.34);
+          background: rgba(40, 28, 17, 0.88);
+          color: #ffe0b3;
+        }
+
+        .orbit-button:hover {
+          border-color: rgba(255, 197, 116, 0.78);
+          background: rgba(91, 57, 22, 0.96);
+        }
+
+        .pan-button:focus-visible {
+          outline: 2px solid #62e6ff;
+          outline-offset: 2px;
+        }
+
+        .orbit-horizontal-button {
+          height: 28px;
+          align-self: center;
+        }
+
+        .orbit-vertical-button {
+          height: 25.2px;
+        }
+
+        .direction-arrow {
+          display: inline-block;
+          width: 22px;
+          height: 22px;
+          overflow: visible;
+        }
+
+        .direction-arrow-shadow,
+        .direction-arrow-face,
+        .direction-arrow-highlight {
+          fill: none;
+          stroke-linecap: round;
+          stroke-linejoin: round;
+        }
+
+        .direction-arrow-shadow {
+          stroke: rgba(58, 36, 16, 0.72);
+          stroke-width: 3.8;
+          transform: translateY(1px);
+        }
+
+        .direction-arrow-face {
+          stroke: currentColor;
+          stroke-width: 2.8;
+        }
+
+        .direction-arrow-highlight {
+          stroke: rgba(255, 255, 255, 0.42);
+          stroke-width: 0.9;
+          transform: translateY(-0.45px);
+        }
+
+        .orbit-curve-arrow {
+          display: inline-block;
+          width: 22px;
+          height: 22px;
+          overflow: visible;
+        }
+
+        .orbit-arrow-shadow,
+        .orbit-arrow-face,
+        .orbit-arrow-highlight {
+          fill: none;
+          stroke-linecap: round;
+          stroke-linejoin: round;
+        }
+
+        .orbit-arrow-shadow {
+          stroke: rgba(58, 36, 16, 0.9);
+          stroke-width: 3.8;
+          transform: translateY(1px);
+        }
+
+        .orbit-arrow-face {
+          stroke: #d9b779;
+          stroke-width: 2.8;
+        }
+
+        .orbit-arrow-highlight {
+          stroke: rgba(255, 236, 194, 0.82);
+          stroke-width: 0.9;
+          transform: translateY(-0.45px);
+        }
+
+        .direction-group:first-child .orbit-horizontal-left {
+          grid-area: 2 / 1;
+        }
+
+        .direction-group:first-child .orbit-horizontal-right {
+          grid-area: 2 / 3;
+        }
+
+        .pan-up {
+          grid-area: 2 / 2;
+        }
+
+        .orbit-vertical-up {
+          grid-area: 1 / 2;
+          align-self: end;
+        }
+
+        .orbit-vertical-down {
+          grid-area: 4 / 2;
+          align-self: start;
+        }
+
+        .pan-left {
+          grid-area: 3 / 1;
+        }
+
+        .pan-right {
+          grid-area: 3 / 3;
+        }
+
+        .pan-down {
+          grid-area: 3 / 2;
+        }
+
+        .direction-group:first-child .pan-down {
+          grid-area: 3 / 2;
+        }
+
         .webgl-fallback {
           position: absolute;
           inset: 0;
@@ -3982,8 +4806,32 @@ export default function App() {
             display: none;
           }
 
+          .direction-controls {
+            right: 16px;
+            bottom: 142px;
+            gap: 10px;
+          }
+
+          .direction-pad {
+            grid-template-columns: repeat(3, 36px);
+            grid-template-rows: repeat(4, 36px);
+          }
+
+          .pan-button {
+            width: 36px;
+            height: 36px;
+          }
+
+          .orbit-horizontal-button {
+            height: 25px;
+          }
+
+          .orbit-vertical-button {
+            height: 22.5px;
+          }
+
           .progress-wrap {
-            bottom: 65px;
+            bottom: 85px;
           }
         }
       `}</style>
@@ -4019,14 +4867,6 @@ export default function App() {
 
         <div className="hud top-right">
           <div className="button-row">
-            <label className="current-toggle">
-              <input
-                type="checkbox"
-                checked={showCurrent}
-                onChange={handleCurrentToggle}
-              />
-              <span>Show current</span>
-            </label>
 
             <button
               className="control"
@@ -4044,22 +4884,55 @@ export default function App() {
               Wrap
             </button>
 
+            <label className="current-toggle">
+              <input
+                type="checkbox"
+                checked={showCurrent}
+                onChange={handleCurrentToggle}
+              />
+              <span>Show current</span>
+            </label>
+
+            <label className="current-toggle">
+              <input
+                type="checkbox"
+                checked={showPoles}
+                onChange={handlePolesToggle}
+              />
+              <span>Show poles</span>
+            </label>
+
             <button
-              className="control"
+              className={`control ${
+                mode === 'none'
+                  ? 'active'
+                  : ''
+              }`}
+              aria-pressed={mode === 'none'}
               onClick={triggerNoField}
             >
               No field
             </button>
 
             <button
-              className="control"
+              className={`control ${
+                mode === 'combined'
+                  ? 'active'
+                  : ''
+              }`}
+              aria-pressed={mode === 'combined'}
               onClick={triggerCombined}
             >
               Combined field
             </button>
 
             <button
-              className="control multicolor"
+              className={`control multicolor ${
+                mode === 'all'
+                  ? 'active'
+                  : ''
+              }`}
+              aria-pressed={mode === 'all'}
               onClick={
                 triggerAllContributions
               }
@@ -4128,12 +5001,215 @@ export default function App() {
 
         <div className="help">
           Drag = orbit · Wheel = zoom ·
-          Right-drag = pan · Click a
+          Right-drag / hold arrows = pan ·
+          Shift+arrows = orbit · Click a
           wrapped section = isolate its
           field · Shift+click sections to
           compare their fields ·
-          Click or drag the progress bar
+          Click the progress bar
           to jump to a section count
+        </div>
+
+        <div className="direction-controls">
+          <div className="direction-group">
+              <span className="direction-label">Pan / Orbit</span>
+            <div
+              className="direction-pad"
+              role="group"
+              aria-label="Pan and orbit controls"
+            >
+              <button
+                type="button"
+                className="pan-button orbit-button orbit-vertical-button orbit-vertical-up"
+                aria-label="Orbit up"
+                title="Orbit up"
+                onPointerDown={(event) => {
+                  event.currentTarget.setPointerCapture(event.pointerId);
+                  triggerOrbitHold('up', true);
+                }}
+                onPointerUp={(event) => {
+                  triggerOrbitHold('up', false);
+                  event.currentTarget.releasePointerCapture(event.pointerId);
+                }}
+                onPointerCancel={() => triggerOrbitHold('up', false)}
+                onLostPointerCapture={() => triggerOrbitHold('up', false)}
+                onClick={(event) => {
+                  if (event.detail === 0) triggerOrbit('up');
+                }}
+              ><DirectionArrow direction="up" /></button>
+              <button
+                type="button"
+                className="pan-button orbit-button orbit-horizontal-button orbit-horizontal-left"
+                aria-label="Orbit left"
+                title="Orbit left"
+                onPointerDown={(event) => {
+                  event.currentTarget.setPointerCapture(event.pointerId);
+                  triggerOrbitHold('left', true);
+                }}
+                onPointerUp={(event) => {
+                  triggerOrbitHold('left', false);
+                  event.currentTarget.releasePointerCapture(event.pointerId);
+                }}
+                onPointerCancel={() => triggerOrbitHold('left', false)}
+                onLostPointerCapture={() => triggerOrbitHold('left', false)}
+                onClick={(event) => {
+                  if (event.detail === 0) triggerOrbit('left');
+                }}
+              >
+                <svg
+                  className="orbit-curve-arrow orbit-curve-left"
+                  viewBox="0 0 24 24"
+                  aria-hidden="true"
+                >
+                  <path
+                    className="orbit-arrow-shadow"
+                    d="M20 19 C12 19 8 14 8 8 M4 8 L8 4 L12 8"
+                  />
+                  <path
+                    className="orbit-arrow-face"
+                    d="M20 19 C12 19 8 14 8 8 M4 8 L8 4 L12 8"
+                  />
+                  <path
+                    className="orbit-arrow-highlight"
+                    d="M20 19 C12 19 8 14 8 8 M4 8 L8 4 L12 8"
+                  />
+                </svg>
+              </button>
+              <button
+                type="button"
+                className="pan-button pan-up"
+                aria-label="Pan up"
+                title="Pan up"
+                onPointerDown={(event) => {
+                  event.currentTarget.setPointerCapture(event.pointerId);
+                  triggerPanHold('up', true);
+                }}
+                onPointerUp={(event) => {
+                  triggerPanHold('up', false);
+                  event.currentTarget.releasePointerCapture(event.pointerId);
+                }}
+                onPointerCancel={() => triggerPanHold('up', false)}
+                onLostPointerCapture={() => triggerPanHold('up', false)}
+                onClick={(event) => {
+                  if (event.detail === 0) triggerPan('up');
+                }}
+              ><DirectionArrow direction="up" /></button>
+              <button
+                type="button"
+                className="pan-button orbit-button orbit-horizontal-button orbit-horizontal-right"
+                aria-label="Orbit right"
+                title="Orbit right"
+                onPointerDown={(event) => {
+                  event.currentTarget.setPointerCapture(event.pointerId);
+                  triggerOrbitHold('right', true);
+                }}
+                onPointerUp={(event) => {
+                  triggerOrbitHold('right', false);
+                  event.currentTarget.releasePointerCapture(event.pointerId);
+                }}
+                onPointerCancel={() => triggerOrbitHold('right', false)}
+                onLostPointerCapture={() => triggerOrbitHold('right', false)}
+                onClick={(event) => {
+                  if (event.detail === 0) triggerOrbit('right');
+                }}
+              >
+                <svg
+                  className="orbit-curve-arrow"
+                  viewBox="0 0 24 24"
+                  aria-hidden="true"
+                >
+                  <path
+                    className="orbit-arrow-shadow"
+                    d="M4 19 C12 19 16 14 16 8 M12 8 L16 4 L20 8"
+                  />
+                  <path
+                    className="orbit-arrow-face"
+                    d="M4 19 C12 19 16 14 16 8 M12 8 L16 4 L20 8"
+                  />
+                  <path
+                    className="orbit-arrow-highlight"
+                    d="M4 19 C12 19 16 14 16 8 M12 8 L16 4 L20 8"
+                  />
+                </svg>
+              </button>
+              <button
+                type="button"
+                className="pan-button pan-left"
+                aria-label="Pan left"
+                title="Pan left"
+                onPointerDown={(event) => {
+                  event.currentTarget.setPointerCapture(event.pointerId);
+                  triggerPanHold('left', true);
+                }}
+                onPointerUp={(event) => {
+                  triggerPanHold('left', false);
+                  event.currentTarget.releasePointerCapture(event.pointerId);
+                }}
+                onPointerCancel={() => triggerPanHold('left', false)}
+                onLostPointerCapture={() => triggerPanHold('left', false)}
+                onClick={(event) => {
+                  if (event.detail === 0) triggerPan('left');
+                }}
+              ><DirectionArrow direction="left" /></button>
+              <button
+                type="button"
+                className="pan-button pan-right"
+                aria-label="Pan right"
+                title="Pan right"
+                onPointerDown={(event) => {
+                  event.currentTarget.setPointerCapture(event.pointerId);
+                  triggerPanHold('right', true);
+                }}
+                onPointerUp={(event) => {
+                  triggerPanHold('right', false);
+                  event.currentTarget.releasePointerCapture(event.pointerId);
+                }}
+                onPointerCancel={() => triggerPanHold('right', false)}
+                onLostPointerCapture={() => triggerPanHold('right', false)}
+                onClick={(event) => {
+                  if (event.detail === 0) triggerPan('right');
+                }}
+              ><DirectionArrow direction="right" /></button>
+              <button
+                type="button"
+                className="pan-button pan-down"
+                aria-label="Pan down"
+                title="Pan down"
+                onPointerDown={(event) => {
+                  event.currentTarget.setPointerCapture(event.pointerId);
+                  triggerPanHold('down', true);
+                }}
+                onPointerUp={(event) => {
+                  triggerPanHold('down', false);
+                  event.currentTarget.releasePointerCapture(event.pointerId);
+                }}
+                onPointerCancel={() => triggerPanHold('down', false)}
+                onLostPointerCapture={() => triggerPanHold('down', false)}
+                onClick={(event) => {
+                  if (event.detail === 0) triggerPan('down');
+                }}
+              ><DirectionArrow direction="down" /></button>
+              <button
+                type="button"
+                className="pan-button orbit-button orbit-vertical-button orbit-vertical-down"
+                aria-label="Orbit down"
+                title="Orbit down"
+                onPointerDown={(event) => {
+                  event.currentTarget.setPointerCapture(event.pointerId);
+                  triggerOrbitHold('down', true);
+                }}
+                onPointerUp={(event) => {
+                  triggerOrbitHold('down', false);
+                  event.currentTarget.releasePointerCapture(event.pointerId);
+                }}
+                onPointerCancel={() => triggerOrbitHold('down', false)}
+                onLostPointerCapture={() => triggerOrbitHold('down', false)}
+                onClick={(event) => {
+                  if (event.detail === 0) triggerOrbit('down');
+                }}
+              ><DirectionArrow direction="down" /></button>
+            </div>
+          </div>
         </div>
 
         <div className="progress-wrap">
