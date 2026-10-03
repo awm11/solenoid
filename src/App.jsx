@@ -28,8 +28,26 @@ const PULSE_REPEAT_TURNS = 3;
 // Number of points used to actually curve each wire section.
 const SECTION_CURVE_SAMPLES = 8;
 
-// Visual field resolution.
-const FIELD_STEPS = 7;
+// While wrapping, the field lines are rebuilt every frame using every
+// Nth curve sample per section for the field sum (cheaper, slightly
+// coarser). The full-resolution field is rebuilt when the animation ends.
+const ANIMATED_FIELD_STRIDE = 2;
+
+// Wrap/unwrap animation length grows gently with the number of sections
+// moved: one section takes WRAP_BASE_MS, each extra section adds
+// WRAP_MS_PER_EXTRA_SECTION, capped at WRAP_MAX_MS (72 sections -> 3.5 s).
+const WRAP_BASE_MS = 1720;
+const WRAP_MS_PER_EXTRA_SECTION = 25;
+const WRAP_MAX_MS = 3500;
+
+function wrapDurationMs(sectionsMoved) {
+  return Math.min(
+    WRAP_MAX_MS,
+    WRAP_BASE_MS +
+      WRAP_MS_PER_EXTRA_SECTION *
+        Math.max(0, sectionsMoved - 1),
+  );
+}
 
 function lerpVec3(a, b, t) {
   return new THREE.Vector3().lerpVectors(a, b, t);
@@ -62,15 +80,6 @@ function coilPointAt(
 }
 
 /*
- * Boundary points between sections.
- */
-function makeCoilPoint(index) {
-  return coilPointAt(
-    index / SECTION_COUNT,
-  );
-}
-
-/*
  * Straight wire is kept as a useful intermediate state for the
  * sections that have not yet been wrapped.
  */
@@ -91,20 +100,6 @@ function makeStraightPoint(index, tailPull = 0) {
     0,
     0,
   ).add(STRAIGHT_OFFSET);
-}
-
-function getTargetPoints() {
-  return Array.from(
-    { length: SECTION_COUNT + 1 },
-    (_, i) => makeCoilPoint(i),
-  );
-}
-
-function getStraightPoints() {
-  return Array.from(
-    { length: SECTION_COUNT + 1 },
-    (_, i) => makeStraightPoint(i),
-  );
 }
 
 /*
@@ -152,15 +147,9 @@ function getCurvedSectionPoints(
  * 0   = completely straight
  * 0-1 = smoothly morphing straight -> curved
  * 1   = completely wrapped
- *
- * We intentionally do NOT use `sectionIndex >= wrappedCount`
- * here to decide whether the section is straight. Doing that
- * causes sections after the first animated section to remain
- * completely straight until the animation finishes.
  */
 function getSectionPath(
   sectionIndex,
-  wrappedCount,
   animatedWrap = 1,
   pitch = COIL_PITCH,
   tailPull = 0,
@@ -228,26 +217,18 @@ function getSectionPath(
  */
 function getAllSectionPaths(
   wrappedCount,
-  animatedWrap = 1,
   pitch = COIL_PITCH,
   tailPull = 0,
 ) {
   return Array.from(
     { length: SECTION_COUNT },
-    (_, i) => {
-      const wrapAmount =
-        i < wrappedCount
-          ? animatedWrap
-          : 0;
-
-      return getSectionPath(
+    (_, i) =>
+      getSectionPath(
         i,
-        wrappedCount,
-        wrapAmount,
+        i < wrappedCount ? 1 : 0,
         pitch,
         tailPull,
-      );
-    },
+      ),
   );
 }
 
@@ -274,68 +255,30 @@ function getAnimatedSectionPaths(
   previousPaths,
   tailPull = 0,
 ) {
-  const easingT =
-    Math.max(0, Math.min(1, t));
+  const low = Math.min(fromCount, toCount);
+  const high = Math.max(fromCount, toCount);
+  const changingWrap =
+    toCount > fromCount ? t : 1 - t;
 
   const paths = [];
 
-  for (
-    let i = 0;
-    i < SECTION_COUNT;
-    i++
-  ) {
-    if (
-      previousPaths &&
-      i < Math.min(fromCount, toCount)
-    ) {
+  for (let i = 0; i < SECTION_COUNT; i++) {
+    // Sections that stay wrapped can reuse their existing path.
+    if (previousPaths && i < low) {
       paths.push(previousPaths[i]);
       continue;
     }
 
-    let wrapAmount = 0;
-
-    if (toCount > fromCount) {
-      /*
-       * Already wrapped sections stay fully wrapped.
-       */
-      if (i < fromCount) {
-        wrapAmount = 1;
-      }
-      /*
-       * Every newly-added section curls at
-       * the same time.
-       */
-      else if (
-        i < toCount
-      ) {
-        wrapAmount = easingT;
-      }
-    } else if (toCount < fromCount) {
-      /*
-       * Sections remaining in the coil stay wrapped.
-       */
-      if (i < toCount) {
-        wrapAmount = 1;
-      }
-      /*
-       * Every section being removed uncurls
-       * at the same time.
-       */
-      else if (
-        i < fromCount
-      ) {
-        wrapAmount =
-          1 - easingT;
-      }
-    } else {
-      wrapAmount =
-        i < fromCount ? 1 : 0;
-    }
+    const wrapAmount =
+      i < low
+        ? 1
+        : i < high
+          ? changingWrap
+          : 0;
 
     paths.push(
       getSectionPath(
         i,
-        1,
         wrapAmount,
         pitch,
         tailPull,
@@ -646,186 +589,97 @@ function makeFieldRing(
 }
 
 /*
- * Approximate Biot-Savart contribution from a tiny straight
- * element between a and b.
+ * Flatten the wire into a packed list of straight current elements
+ * (midpoint xyz, dl xyz) so the Biot-Savart sum below is plain
+ * arithmetic with no per-step Vector3 allocations.
+ *
+ * `stride` > 1 skips intermediate curve samples, giving a coarser
+ * but much cheaper approximation (used while animating).
+ *
+ * `weightOf(i)` scales section i's current. During a wrap animation
+ * the sections being added/removed are weighted by how far they have
+ * curled, so the field fades smoothly instead of jumping.
  */
-function segmentField(
-  point,
-  a,
-  b,
-) {
-  const dl =
-    new THREE.Vector3().subVectors(
-      b,
-      a,
-    );
-
-  const mid =
-    new THREE.Vector3()
-      .addVectors(a, b)
-      .multiplyScalar(0.5);
-
-  const r =
-    new THREE.Vector3().subVectors(
-      point,
-      mid,
-    );
-
-  const rSq = Math.max(
-    r.lengthSq(),
-    0.035,
-  );
-
-  const cross =
-    new THREE.Vector3()
-      .crossVectors(dl, r);
-
-  cross.multiplyScalar(
-    1 / Math.pow(
-      rSq,
-      1.5,
-    ),
-  );
-
-  return cross;
-}
-
-/*
- * Field generated by ONE curved wire section.
- */
-function curvedSectionField(
-  point,
-  sectionPath,
-) {
-  const field =
-    new THREE.Vector3();
-
-  for (
-    let i = 0;
-    i <
-    sectionPath.length - 1;
-    i++
-  ) {
-    field.add(
-      segmentField(
-        point,
-        sectionPath[i],
-        sectionPath[i + 1],
-      ),
-    );
-  }
-
-  return field;
-}
-
-/*
- * Combined field from all wrapped sections.
- */
-function coilField(
-  point,
+function buildCurrentElements(
   sectionPaths,
   activeCount,
+  stride = 1,
+  weightOf = () => 1,
 ) {
-  const field =
-    new THREE.Vector3();
+  const values = [];
 
-  for (
-    let sectionIndex = 0;
-    sectionIndex < activeCount;
-    sectionIndex++
-  ) {
-    field.add(
-      curvedSectionField(
-        point,
-        sectionPaths[
-          sectionIndex
-        ],
-      ),
-    );
-  }
+  for (let s = 0; s < activeCount; s++) {
+    const weight = weightOf(s);
 
-  return field;
-}
+    if (weight <= 0) {
+      continue;
+    }
 
-/*
- * Field from one selected section.
- */
-function singleSectionField(
-  point,
-  sectionPaths,
-  sectionIndex,
-) {
-  if (
-    sectionIndex == null ||
-    sectionIndex < 0 ||
-    sectionIndex >=
-      sectionPaths.length
-  ) {
-    return new THREE.Vector3();
-  }
+    const path = sectionPaths[s];
+    const last = path.length - 1;
 
-  return curvedSectionField(
-    point,
-    sectionPaths[
-      sectionIndex
-    ],
-  );
-}
+    for (let j = 0; j < last; j += stride) {
+      const a = path[j];
+      const b = path[Math.min(j + stride, last)];
 
-/*
- * Field from a SET of selected sections.
- */
-function selectedSectionsField(
-  point,
-  sectionPaths,
-  sectionIndices,
-) {
-  const field =
-    new THREE.Vector3();
-
-  if (
-    !sectionIndices ||
-    !sectionIndices.length
-  ) {
-    return field;
-  }
-
-  sectionIndices.forEach(
-    (sectionIndex) => {
-      if (
-        sectionIndex == null ||
-        sectionIndex < 0 ||
-        sectionIndex >=
-          sectionPaths.length
-      ) {
-        return;
-      }
-
-      field.add(
-        curvedSectionField(
-          point,
-          sectionPaths[
-            sectionIndex
-          ],
-        ),
+      values.push(
+        (a.x + b.x) * 0.5,
+        (a.y + b.y) * 0.5,
+        (a.z + b.z) * 0.5,
+        (b.x - a.x) * weight,
+        (b.y - a.y) * weight,
+        (b.z - a.z) * weight,
       );
-    },
-  );
+    }
+  }
 
-  return field;
+  return new Float64Array(values);
 }
 
 /*
- * Trace a field line using the COMBINED field.
+ * Approximate Biot-Savart field at (px, py, pz) from packed current
+ * elements. Writes the result into `out` and returns it.
+ */
+function fieldAt(px, py, pz, elements, out) {
+  let bx = 0;
+  let by = 0;
+  let bz = 0;
+
+  for (let k = 0; k < elements.length; k += 6) {
+    const rx = px - elements[k];
+    const ry = py - elements[k + 1];
+    const rz = pz - elements[k + 2];
+    const dx = elements[k + 3];
+    const dy = elements[k + 4];
+    const dz = elements[k + 5];
+
+    let rSq = rx * rx + ry * ry + rz * rz;
+
+    if (rSq < 0.035) {
+      rSq = 0.035;
+    }
+
+    const inv = 1 / (rSq * Math.sqrt(rSq));
+
+    bx += (dy * rz - dz * ry) * inv;
+    by += (dz * rx - dx * rz) * inv;
+    bz += (dx * ry - dy * rx) * inv;
+  }
+
+  return out.set(bx, by, bz);
+}
+
+/*
+ * Trace a field line through the combined field.
  */
 function traceCombinedStreamline(
   seed,
   directionSign,
-  sectionPaths,
-  activeCount,
+  elements,
 ) {
   const linePoints = [];
-  let p = seed.clone();
+  const p = seed.clone();
+  const b = new THREE.Vector3();
 
   for (
     let step = 0;
@@ -836,12 +690,7 @@ function traceCombinedStreamline(
       p.clone(),
     );
 
-    const b =
-      coilField(
-        p,
-        sectionPaths,
-        activeCount,
-      );
+    fieldAt(p.x, p.y, p.z, elements, b);
 
     const magnitude =
       b.length();
@@ -855,131 +704,14 @@ function traceCombinedStreamline(
       break;
     }
 
-    b.normalize().multiplyScalar(
-      directionSign * 0.14,
+    p.addScaledVector(
+      b,
+      (directionSign * 0.14) / magnitude,
     );
-
-    p.add(b);
 
     if (
       Math.abs(p.x) > 13 ||
       Math.abs(p.y) > 10 ||
-      Math.abs(p.z) > 12
-    ) {
-      break;
-    }
-  }
-
-  return linePoints;
-}
-
-/*
- * Trace a field line generated by ONE section.
- */
-function traceIndividualStreamline(
-  seed,
-  directionSign,
-  sectionPaths,
-  sectionIndex,
-) {
-  const linePoints = [];
-  let p = seed.clone();
-
-  for (
-    let step = 0;
-    step < 125;
-    step++
-  ) {
-    linePoints.push(
-      p.clone(),
-    );
-
-    const b =
-      singleSectionField(
-        p,
-        sectionPaths,
-        sectionIndex,
-      );
-
-    const magnitude =
-      b.length();
-
-    if (
-      !Number.isFinite(
-        magnitude,
-      ) ||
-      magnitude < 0.0005
-    ) {
-      break;
-    }
-
-    b.normalize().multiplyScalar(
-      directionSign * 0.15,
-    );
-
-    p.add(b);
-
-    if (
-      Math.abs(p.x) > 13 ||
-      Math.abs(p.y) > 11 ||
-      Math.abs(p.z) > 12
-    ) {
-      break;
-    }
-  }
-
-  return linePoints;
-}
-
-/*
- * Trace a field line generated by a SET of selected sections.
- */
-function traceSelectionStreamline(
-  seed,
-  directionSign,
-  sectionPaths,
-  sectionIndices,
-) {
-  const linePoints = [];
-  let p = seed.clone();
-
-  for (
-    let step = 0;
-    step < 125;
-    step++
-  ) {
-    linePoints.push(
-      p.clone(),
-    );
-
-    const b =
-      selectedSectionsField(
-        p,
-        sectionPaths,
-        sectionIndices,
-      );
-
-    const magnitude =
-      b.length();
-
-    if (
-      !Number.isFinite(
-        magnitude,
-      ) ||
-      magnitude < 0.0005
-    ) {
-      break;
-    }
-
-    b.normalize().multiplyScalar(
-      directionSign * 0.15,
-    );
-
-    p.add(b);
-
-    if (
-      Math.abs(p.x) > 13 ||
-      Math.abs(p.y) > 11 ||
       Math.abs(p.z) > 12
     ) {
       break;
@@ -1059,115 +791,41 @@ function addStreamlineArrows(
   }
 }
 
-function makeSectionSeeds(
-  sectionPath,
-) {
-  const center =
-    new THREE.Vector3();
-
-  sectionPath.forEach((p) =>
-    center.add(p),
-  );
-
-  center.multiplyScalar(
-    1 / sectionPath.length,
-  );
-
-  const tangent =
-    new THREE.Vector3()
-      .subVectors(
-        sectionPath[
-          sectionPath.length - 1
-        ],
-        sectionPath[0],
-      )
-      .normalize();
-
-  const helper =
-    Math.abs(
-      tangent.dot(
-        new THREE.Vector3(
-          0,
-          1,
-          0,
-        ),
-      ),
-    ) > 0.85
-      ? new THREE.Vector3(
-          1,
-          0,
-          0,
-        )
-      : new THREE.Vector3(
-          0,
-          1,
-          0,
-        );
-
-  const u =
-    new THREE.Vector3()
-      .crossVectors(
-        tangent,
-        helper,
-      )
-      .normalize();
-
-  const v =
-    new THREE.Vector3()
-      .crossVectors(
-        tangent,
-        u,
-      )
-      .normalize();
-
-  const seeds = [];
-
-  const loops = 0;
-  const radius = 0.15;
-
-  for (
-    let i = 0;
-    i < loops;
-    i++
-  ) {
-    const angle =
-      (i / loops) *
-      Math.PI *
-      2;
-
-    seeds.push(
-      center
-        .clone()
-        .addScaledVector(
-          u,
-          Math.cos(angle) *
-            radius,
-        )
-        .addScaledVector(
-          v,
-          Math.sin(angle) *
-            radius,
-        ),
-    );
-  }
-
-  return seeds;
-}
-
 /*
  * Combined-field view.
+ *
+ * options:
+ *   pitch     - coil pitch, used to place seeds along the finished helix
+ *   seedSpan  - how many sections' worth of coil to spread seeds over
+ *               (may be fractional mid-animation; defaults to activeCount)
+ *   stride    - curve-sample stride for the field sum (see above)
+ *   weightOf  - per-section current weight (see above)
  */
 function buildCombinedField(
   sectionPaths,
   activeCount,
   lineCount = 18,
+  {
+    pitch = COIL_PITCH,
+    seedSpan = activeCount,
+    stride = 1,
+    weightOf,
+  } = {},
 ) {
   const group =
     new THREE.Group();
 
-  if (activeCount <= 0) {
+  if (activeCount <= 0 || seedSpan <= 0) {
     return group;
   }
+
+  const elements =
+    buildCurrentElements(
+      sectionPaths,
+      activeCount,
+      stride,
+      weightOf,
+    );
 
   /*
    * Seed the requested number of lines at evenly-spaced axial positions
@@ -1175,6 +833,11 @@ function buildCombinedField(
    * the combined field a useful mix of lines through the solenoid and
    * return lines outside it, while the golden-angle rotation avoids the
    * visible three-cluster pattern of the old fixed seed set.
+   *
+   * Seeds are spread continuously along the finished helix (not
+   * snapped to section centres), so as `seedSpan` changes during a wrap
+   * every seed slides smoothly on every frame instead of stepping a
+   * whole section at a time.
    */
   const seeds = [];
   const count = Math.max(1, Math.round(lineCount));
@@ -1188,25 +851,11 @@ function buildCombinedField(
         ? 0.5
         : (i + 0.5) / count;
 
-    const sectionIndex = Math.min(
-      activeCount - 1,
-      Math.floor(
-        axialFraction * activeCount,
-      ),
-    );
-
-    const sectionPath =
-      sectionPaths[sectionIndex];
-
-    const center = new THREE.Vector3();
-
-    sectionPath.forEach((p) =>
-      center.add(p),
-    );
-
-    center.multiplyScalar(
-      1 / sectionPath.length,
-    );
+    const centerX =
+      coilPointAt(
+        (axialFraction * seedSpan) / SECTION_COUNT,
+        pitch,
+      ).x;
 
     const angle =
       i * goldenAngle;
@@ -1218,7 +867,7 @@ function buildCombinedField(
 
     seeds.push(
       new THREE.Vector3(
-        center.x,
+        centerX,
         Math.cos(angle) * radius,
         axisCenterZ +
           Math.sin(angle) * radius,
@@ -1226,22 +875,26 @@ function buildCombinedField(
     );
   }
 
+  const colors = [
+    0x4de4ff,
+    0x68b5ff,
+    0x8c7bff,
+  ];
+
   seeds.forEach(
     (seed, seedIndex) => {
       const forward =
         traceCombinedStreamline(
           seed,
           1,
-          sectionPaths,
-          activeCount,
+          elements,
         );
 
       const backward =
         traceCombinedStreamline(
           seed,
           -1,
-          sectionPaths,
-          activeCount,
+          elements,
         );
 
       const traced = [
@@ -1258,12 +911,6 @@ function buildCombinedField(
           .setFromPoints(
             traced,
           );
-
-      const colors = [
-        0x4de4ff,
-        0x68b5ff,
-        0x8c7bff,
-      ];
 
       const color =
         colors[
@@ -1306,7 +953,6 @@ function buildCombinedField(
  */
 function buildAllContributionsField(
   sectionPaths,
-  activeCount,
   sectionIndices,
 ) {
   const group =
@@ -1397,46 +1043,6 @@ function buildAllContributionsField(
       },
     );
 
-    const seeds =
-      makeSectionSeeds(
-        sectionPath,
-      );
-
-    seeds.forEach((seed) => {
-      const traced =
-        traceIndividualStreamline(
-          seed,
-          1,
-          sectionPaths,
-          sectionIndex,
-        );
-
-      if (traced.length < 7) {
-        return;
-      }
-
-      const geometry =
-        new THREE.BufferGeometry()
-          .setFromPoints(
-            traced,
-          );
-
-      const material =
-        new THREE.LineBasicMaterial({
-          color,
-          transparent: true,
-          opacity: 0.26,
-          depthWrite: false,
-        });
-
-      sectionGroup.add(
-        new THREE.Line(
-          geometry,
-          material,
-        ),
-      );
-    });
-
     group.add(sectionGroup);
   }
 
@@ -1516,46 +1122,6 @@ function buildSectionField(
         },
       );
 
-      const seeds =
-        makeSectionSeeds(
-          sectionPath,
-        );
-
-      seeds.forEach((seed) => {
-        const traced =
-          traceSelectionStreamline(
-            seed,
-            1,
-            sectionPaths,
-            validIndices,
-          );
-
-        if (traced.length < 7) {
-          return;
-        }
-
-        const geometry =
-          new THREE.BufferGeometry()
-            .setFromPoints(
-              traced,
-            );
-
-        const material =
-          new THREE.LineBasicMaterial({
-            color: 0xff76da,
-            transparent: true,
-            opacity: 0.62,
-            depthWrite: false,
-          });
-
-        group.add(
-          new THREE.Line(
-            geometry,
-            material,
-          ),
-        );
-      });
-
       const arrow =
         new THREE.ArrowHelper(
           tangent,
@@ -1608,6 +1174,57 @@ function DirectionArrow({ direction }) {
         d={path}
       />
     </svg>
+  );
+}
+
+function SliderField({
+  label,
+  valueText,
+  value,
+  min,
+  max,
+  step,
+  onChange,
+  disabled = false,
+  disabledHint,
+}) {
+  const fraction =
+    (value - min) / (max - min);
+
+  return (
+    <label
+      className={`slider-field${
+        disabled ? ' is-disabled' : ''
+      }`}
+      title={disabled ? disabledHint : undefined}
+    >
+      <span className="slider-head">
+        <span className="slider-label">
+          {label}
+        </span>
+
+        <span className="slider-value">
+          {valueText}
+        </span>
+      </span>
+
+      <input
+        className="slider-input"
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        onChange={onChange}
+        disabled={disabled}
+        style={{
+          '--fill': Math.min(
+            1,
+            Math.max(0, fraction),
+          ),
+        }}
+      />
+    </label>
   );
 }
 
@@ -2071,18 +1688,14 @@ export default function App() {
     const heldOrbitButtons = new Set();
     let animationFrom = 0;
     let animationTo = 0;
+    let animationDuration = WRAP_BASE_MS;
     let tailPullFrom = 0;
     let tailPullTo = 0;
 
     const hitTargets = [];
 
     const state = {
-      sectionPaths:
-        getAllSectionPaths(
-          0,
-          1,
-          coilPitchRef.current,
-        ),
+      sectionPaths: [],
 
       tailPull: 0,
       fieldBlend: 1,
@@ -2261,8 +1874,6 @@ export default function App() {
         mesh.userData.sectionIndex =
           i;
 
-        mesh.castShadow = true;
-
         sectionWireGroups[i].add(mesh);
         hitTargets[i] = mesh;
 
@@ -2376,64 +1987,77 @@ export default function App() {
         );
 
         /*
-         * Small current markers.
+         * Current pulse marker.
          */
-        [0].forEach(
-          (_, markerIndex) => {
-            const glowCurve =
+        const marker =
+          new THREE.Mesh(
+            new THREE.TubeGeometry(
               new THREE.CatmullRomCurve3(
                 sectionPath,
                 false,
                 'centripetal',
-              );
+              ),
+              8,
+              0.095,
+              8,
+              false,
+            ),
+            new THREE.MeshBasicMaterial({
+              color: 0x9f1d35,
+              transparent: true,
+              depthTest: false,
+              depthWrite: false,
+              opacity: isSelected ? 1 : 0.65,
+            }),
+          );
 
-            const marker =
-              new THREE.Mesh(
-                new THREE.TubeGeometry(
-                  glowCurve,
-                  8,
-                  0.095,
-                  8,
-                  false,
-                ),
-                new THREE.MeshBasicMaterial({
-                  color: 0x9f1d35,
+        marker.renderOrder = 6;
 
-                  transparent: true,
-                  depthTest: false,
-                  depthWrite: false,
+        marker.userData.pulsePhase =
+          (i / SECTION_COUNT) *
+          (COIL_TURNS / PULSE_REPEAT_TURNS) *
+          Math.PI *
+          2;
 
-                  opacity:
-                    isSelected
-                      ? 1
-                      : 0.65,
-                }),
-              );
+        marker.userData.baseOpacity =
+          isSelected ? 1 : 0.65;
 
-            marker.renderOrder = 6;
-
-            marker.userData.pulseIndex =
-              i * 2 + markerIndex;
-
-            marker.userData.pulsePhase =
-              (
-                (i + markerIndex * 0.5) /
-                SECTION_COUNT *
-                COIL_TURNS /
-                PULSE_REPEAT_TURNS
-              ) *
-              Math.PI *
-              2;
-
-            marker.userData.baseOpacity =
-              isSelected ? 1 : 0.65;
-
-            sectionPulseGroups[i].add(
-              marker,
-            );
-          },
-        );
+        sectionPulseGroups[i].add(marker);
       }
+    }
+
+    /*
+     * Swap one named field group for a freshly built one,
+     * recording each material's base opacity for blending.
+     */
+    function replaceFieldGroup(
+      name,
+      group,
+    ) {
+      const old =
+        fieldGroup.getObjectByName(name);
+
+      if (old) {
+        fieldGroup.remove(old);
+        disposeObject(old);
+      }
+
+      group.name = name;
+
+      group.traverse((obj) => {
+        if (
+          obj.material &&
+          'opacity' in obj.material
+        ) {
+          obj.material.userData = {
+            ...(obj.material.userData || {}),
+            fieldMode: name,
+            baseOpacity: obj.material.opacity,
+          };
+        }
+      });
+
+      fieldGroup.add(group);
     }
 
     /*
@@ -2444,85 +2068,91 @@ export default function App() {
       activeCount,
       activeSelections,
     ) {
-      while (
-        fieldGroup.children.length
-      ) {
-        const child =
-          fieldGroup.children.pop();
-
-        disposeObject(child);
-      }
-
-      const combined =
+      replaceFieldGroup(
+        'combinedField',
         buildCombinedField(
           sectionPaths,
           activeCount,
           stateRef.current.combinedLineCount,
-        );
+          { pitch: coilPitchRef.current },
+        ),
+      );
 
-      const allContributions =
+      replaceFieldGroup(
+        'allContributionsField',
         buildAllContributionsField(
           sectionPaths,
-          activeCount,
-        );
+        ),
+      );
 
-      const individual =
+      replaceFieldGroup(
+        'individualField',
         buildSectionField(
           sectionPaths,
           activeSelections,
-        );
-
-      combined.name =
-        'combinedField';
-
-      allContributions.name =
-        'allContributionsField';
-
-      individual.name =
-        'individualField';
-
-      [
-        combined,
-        allContributions,
-        individual,
-      ].forEach((group) => {
-        group.traverse((obj) => {
-          if (
-            obj.material &&
-            'opacity' in
-              obj.material
-          ) {
-            obj.material.userData =
-              {
-                ...(
-                  obj.material
-                    .userData || {}
-                ),
-
-                fieldMode:
-                  group.name,
-
-                baseOpacity:
-                  obj.material
-                    .opacity,
-              };
-          }
-        });
-      });
-
-      fieldGroup.add(
-        combined,
-      );
-
-      fieldGroup.add(
-        allContributions,
-      );
-
-      fieldGroup.add(
-        individual,
+        ),
       );
 
       updateFieldBlend();
+    }
+
+    /*
+     * Per-frame field refresh while sections wrap/unwrap.
+     *
+     * Only the group for the visible mode is rebuilt, and the
+     * combined field uses a coarser current approximation.
+     * ('all' mode is already updated per section every frame.)
+     */
+    function refreshFieldDuringWrap(
+      sectionPaths,
+      eased,
+    ) {
+      const { mode, selectedSections } =
+        stateRef.current;
+
+      if (mode === 'combined') {
+        const low =
+          Math.min(animationFrom, animationTo);
+        const high =
+          Math.max(animationFrom, animationTo);
+        const changingWeight =
+          animationTo > animationFrom
+            ? eased
+            : 1 - eased;
+
+        replaceFieldGroup(
+          'combinedField',
+          buildCombinedField(
+            sectionPaths,
+            high,
+            stateRef.current.combinedLineCount,
+            {
+              pitch: coilPitchRef.current,
+              seedSpan: THREE.MathUtils.lerp(
+                animationFrom,
+                animationTo,
+                eased,
+              ),
+              stride: ANIMATED_FIELD_STRIDE,
+              weightOf: (i) =>
+                i < low ? 1 : changingWeight,
+            },
+          ),
+        );
+      } else if (
+        mode === 'individual' &&
+        selectedSections.some(
+          (i) => i >= Math.min(animationFrom, animationTo),
+        )
+      ) {
+        replaceFieldGroup(
+          'individualField',
+          buildSectionField(
+            sectionPaths,
+            selectedSections,
+          ),
+        );
+      }
     }
 
     function rebuildContributionSections(
@@ -2570,7 +2200,6 @@ export default function App() {
         const replacementRoot =
           buildAllContributionsField(
             sectionPaths,
-            SECTION_COUNT,
             [sectionIndex],
           );
 
@@ -2782,6 +2411,11 @@ export default function App() {
       animationTo =
         toCount;
 
+      animationDuration =
+        wrapDurationMs(
+          Math.abs(toCount - animationFrom),
+        );
+
       tailPullFrom =
         state.tailPull;
 
@@ -2789,6 +2423,7 @@ export default function App() {
         toCount *
         SECTION_LENGTH *
         TAIL_PULL_RATIO;
+
     }
 
     function handleWrapNext() {
@@ -2859,11 +2494,14 @@ export default function App() {
         return;
       }
 
+      // React state for the pitch updates on the next render;
+      // the field seeding needs the new value now.
+      coilPitchRef.current = pitch;
+
       const paths =
         getAllSectionPaths(
           stateRef.current
             .wrappedCount,
-          1,
           pitch,
           state.tailPull,
         );
@@ -2890,6 +2528,13 @@ export default function App() {
     }
 
     function handleCombined() {
+      if (
+        stateRef.current.selectedSections.length
+      ) {
+        clearSectionSelection();
+        return;
+      }
+
       setMode('combined');
 
       stateRef.current.mode =
@@ -3347,7 +2992,6 @@ export default function App() {
     rebuildAll(
       getAllSectionPaths(
         0,
-        1,
         coilPitchRef.current,
       ),
     );
@@ -3572,7 +3216,7 @@ export default function App() {
           Math.min(
             (now -
               animationStart) /
-              1720,
+              animationDuration,
             1,
           );
 
@@ -3650,6 +3294,13 @@ export default function App() {
 
         state.sectionPaths = paths;
 
+        if (elapsed < 1) {
+          refreshFieldDuringWrap(
+            paths,
+            eased,
+          );
+        }
+
         if (elapsed >= 1) {
           setWrappedCount(
             animationTo,
@@ -3693,7 +3344,6 @@ export default function App() {
           const finalPaths =
             getAllSectionPaths(
               animationTo,
-              1,
               coilPitchRef.current,
               state.tailPull,
             );
@@ -3922,29 +3572,14 @@ export default function App() {
         ?.showPoles(visible);
     };
 
-  const triggerCombined = () => {
-    setMode('combined');
-    setSelectedSections([]);
-
+  const triggerCombined = () =>
     mountRef.current?._magneticTool?.combined();
-  };
 
-  const triggerAllContributions =
-    () => {
-      setMode('all');
-      setSelectedSections([]);
+  const triggerAllContributions = () =>
+    mountRef.current?._magneticTool?.allContributions();
 
-      mountRef.current?._magneticTool
-        ?.allContributions();
-    };
-
-  const triggerNoField = () => {
-    setMode('none');
-    setSelectedSections([]);
-
-    mountRef.current?._magneticTool
-      ?.noField();
-  };
+  const triggerNoField = () =>
+    mountRef.current?._magneticTool?.noField();
 
   const handlePitchSliderChange =
     (event) => {
@@ -4104,13 +3739,29 @@ export default function App() {
           pointer-events: none;
         }
 
-        .top-left {
+        /*
+         * Title, controls and help share one grid, so they can never
+         * overlap: wide screens put the controls in a right-hand column,
+         * narrow screens stack everything in one column.
+         */
+        .top-bar {
           top: 20px;
           left: 22px;
-          width: min(
-            430px,
-            calc(100% - 44px)
-          );
+          right: 20px;
+          display: grid;
+          grid-template-columns: minmax(300px, 1fr) auto;
+          grid-template-areas:
+            "title controls"
+            "help  controls";
+          grid-template-rows: auto 1fr;
+          column-gap: 24px;
+          row-gap: 12px;
+          align-items: start;
+        }
+
+        .top-title {
+          grid-area: title;
+          min-width: 0;
         }
 
         .kicker {
@@ -4133,32 +3784,81 @@ export default function App() {
           letter-spacing: -0.035em;
         }
 
-        .subtitle {
-          margin-top: 8px;
-          max-width: 390px;
-          font-size: 14px;
-          line-height: 1.45;
-          color: #a8c5d3;
-        }
-
-        .top-right {
-          top: 20px;
-          right: 20px;
-          pointer-events: auto;
+        .top-controls {
+          grid-area: controls;
+          justify-self: end;
+          min-width: 0;
           display: flex;
           flex-direction: column;
           align-items: flex-end;
           gap: 8px;
-          justify-content: flex-start;
-          max-width: none;
+          pointer-events: auto;
         }
 
-        .button-row {
+        /* groups wrap as whole units, never splitting a pair */
+        .toolbar {
           display: flex;
-          align-items: center;
-          gap: 8px;
           flex-wrap: wrap;
           justify-content: flex-end;
+          align-items: center;
+          gap: 8px 14px;
+        }
+
+        .toolbar-group {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+        }
+
+        .segmented {
+          display: inline-flex;
+          align-items: center;
+          gap: 2px;
+          padding: 2px;
+          border: 1px solid rgba(147, 212, 240, 0.18);
+          border-radius: 12px;
+          background: rgba(8, 20, 30, 0.78);
+          backdrop-filter: blur(10px);
+        }
+
+        .segment {
+          padding: 7px 10px;
+          border: 1px solid transparent;
+          border-radius: 9px;
+          background: transparent;
+          color: #a9c6d3;
+          font: inherit;
+          font-size: 12px;
+          font-weight: 700;
+          white-space: nowrap;
+          cursor: pointer;
+          transition:
+            background .15s ease,
+            border-color .15s ease,
+            color .15s ease;
+        }
+
+        .segment:hover:not(.active) {
+          background: rgba(11, 32, 45, 0.9);
+          color: #eaf8ff;
+        }
+
+        .segment:focus-visible {
+          outline: 2px solid rgba(98, 230, 255, 0.6);
+          outline-offset: 1px;
+        }
+
+        .segment.active {
+          border-color: #62e6ff;
+          background: rgba(23, 83, 105, 0.95);
+          color: #eaf8ff;
+          box-shadow: 0 0 14px rgba(98, 230, 255, 0.18);
+        }
+
+        .segment.multicolor.active {
+          border-color: rgba(92, 224, 207, 0.85);
+          background: rgba(16, 78, 76, 0.95);
+          box-shadow: 0 0 14px rgba(92, 224, 207, 0.2);
         }
 
         .current-toggle {
@@ -4183,8 +3883,168 @@ export default function App() {
           margin: 0;
         }
 
-        .slider-control {
-          width: 240px;
+        .slider-panel {
+          display: grid;
+          grid-template-columns: repeat(2, 200px);
+          gap: 18px;
+          padding: 11px 14px 12px;
+          border-radius: 13px;
+          background: rgba(5, 14, 22, 0.78);
+          border: 1px solid rgba(160, 218, 240, 0.15);
+          backdrop-filter: blur(10px);
+        }
+
+        .slider-field {
+          display: flex;
+          flex-direction: column;
+          gap: 7px;
+          min-width: 0;
+          cursor: pointer;
+          transition: opacity .15s ease;
+        }
+
+        .slider-field.is-disabled {
+          opacity: 0.4;
+          cursor: not-allowed;
+        }
+
+        .slider-head {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 10px;
+        }
+
+        .slider-label {
+          color: #c9dbe3;
+          font-size: 10px;
+          font-weight: 800;
+          letter-spacing: 0.08em;
+          text-transform: uppercase;
+          white-space: nowrap;
+        }
+
+        .slider-value {
+          min-width: 44px;
+          padding: 2px 7px;
+          border-radius: 6px;
+          background: rgba(71, 200, 255, 0.1);
+          border: 1px solid rgba(98, 230, 255, 0.18);
+          color: #9eeeff;
+          font-size: 11px;
+          font-weight: 700;
+          font-variant-numeric: tabular-nums;
+          text-align: center;
+        }
+
+        /*
+         * Range input: the track shows the progress-bar gradient up to
+         * the thumb's centre (--fill is 0..1, the thumb is 16px wide).
+         */
+        .slider-input {
+          --thumb: 16px;
+          --track: 6px;
+          --filled: calc(
+            var(--thumb) / 2 +
+              (100% - var(--thumb)) * var(--fill, 0)
+          );
+          -webkit-appearance: none;
+          appearance: none;
+          width: 100%;
+          height: 18px;
+          margin: 0;
+          background: transparent;
+          cursor: inherit;
+        }
+
+        .slider-input:focus {
+          outline: none;
+        }
+
+        .slider-input::-webkit-slider-runnable-track {
+          height: var(--track);
+          border-radius: 999px;
+          border: 1px solid rgba(127, 197, 229, 0.16);
+          background:
+            linear-gradient(90deg, #47c8ff, #8a8dff)
+              0 0 / var(--filled) 100% no-repeat,
+            rgba(127, 197, 229, 0.09);
+        }
+
+        .slider-input::-moz-range-track {
+          height: var(--track);
+          border-radius: 999px;
+          border: 1px solid rgba(127, 197, 229, 0.16);
+          background:
+            linear-gradient(90deg, #47c8ff, #8a8dff)
+              0 0 / var(--filled) 100% no-repeat,
+            rgba(127, 197, 229, 0.09);
+        }
+
+        .slider-input::-webkit-slider-thumb {
+          -webkit-appearance: none;
+          appearance: none;
+          width: var(--thumb);
+          height: var(--thumb);
+          margin-top: calc(
+            (var(--track) - var(--thumb)) / 2 - 1px
+          );
+          border-radius: 50%;
+          border: 2px solid #62e6ff;
+          background: #eaf8ff;
+          box-shadow: 0 0 12px rgba(98, 230, 255, 0.45);
+          transition:
+            transform .15s ease,
+            box-shadow .15s ease;
+        }
+
+        .slider-input::-moz-range-thumb {
+          width: var(--thumb);
+          height: var(--thumb);
+          box-sizing: border-box;
+          border-radius: 50%;
+          border: 2px solid #62e6ff;
+          background: #eaf8ff;
+          box-shadow: 0 0 12px rgba(98, 230, 255, 0.45);
+          transition:
+            transform .15s ease,
+            box-shadow .15s ease;
+        }
+
+        .slider-field:not(.is-disabled):hover
+          .slider-input::-webkit-slider-thumb,
+        .slider-input:active::-webkit-slider-thumb {
+          transform: scale(1.12);
+          box-shadow: 0 0 16px rgba(98, 230, 255, 0.7);
+        }
+
+        .slider-field:not(.is-disabled):hover
+          .slider-input::-moz-range-thumb,
+        .slider-input:active::-moz-range-thumb {
+          transform: scale(1.12);
+          box-shadow: 0 0 16px rgba(98, 230, 255, 0.7);
+        }
+
+        .slider-input:focus-visible::-webkit-slider-thumb {
+          box-shadow:
+            0 0 0 4px rgba(98, 230, 255, 0.28),
+            0 0 16px rgba(98, 230, 255, 0.7);
+        }
+
+        .slider-input:focus-visible::-moz-range-thumb {
+          box-shadow:
+            0 0 0 4px rgba(98, 230, 255, 0.28),
+            0 0 16px rgba(98, 230, 255, 0.7);
+        }
+
+        .slider-input:disabled::-webkit-slider-thumb {
+          border-color: #7f9dad;
+          box-shadow: none;
+        }
+
+        .slider-input:disabled::-moz-range-thumb {
+          border-color: #7f9dad;
+          box-shadow: none;
         }
 
         .control {
@@ -4280,28 +4140,6 @@ export default function App() {
               214,
               255,
               0.34
-            );
-        }
-
-        .control.secondary {
-          color: #ffd2f1;
-          border-color:
-            rgba(
-              255,
-              118,
-              218,
-              0.25
-            );
-        }
-
-        .control.multicolor {
-          color: #dffcff;
-          border-color:
-            rgba(
-              92,
-              224,
-              207,
-              0.3
             );
         }
 
@@ -4498,11 +4336,9 @@ export default function App() {
         }
 
         .help {
-          position: absolute;
-          top: 102px;
-          left: 22px;
-          z-index: 4;
-          pointer-events: none;
+          grid-area: help;
+          justify-self: start;
+          max-width: 560px;
           padding: 9px 11px;
           border-radius: 10px;
           background:
@@ -4510,7 +4346,7 @@ export default function App() {
               5,
               14,
               22,
-              0.58
+              0.78
             );
           border: 1px solid
             rgba(
@@ -4519,7 +4355,8 @@ export default function App() {
               240,
               0.12
             );
-          color: #82a5b5;
+          backdrop-filter: blur(10px);
+          color: #8fb1c1;
           font-size: 11px;
           line-height: 1.4;
         }
@@ -4543,7 +4380,7 @@ export default function App() {
         }
 
         .direction-label {
-          color: #9cb9c8;
+          color: #c9cdcf;
           font-size: 10px;
           font-weight: 800;
           letter-spacing: 0.08em;
@@ -4708,10 +4545,6 @@ export default function App() {
           grid-area: 3 / 2;
         }
 
-        .direction-group:first-child .pan-down {
-          grid-area: 3 / 2;
-        }
-
         .webgl-fallback {
           position: absolute;
           inset: 0;
@@ -4740,10 +4573,6 @@ export default function App() {
         }
 
         @media (max-width: 1000px) {
-          .top-right {
-            max-width: 430px;
-          }
-
           .control {
             padding: 8px 9px;
           }
@@ -4761,47 +4590,40 @@ export default function App() {
             border: 0;
           }
 
-          .top-right {
-            top: 122px;
+          .top-bar {
+            top: 16px;
             left: 18px;
             right: 18px;
-            max-width: none;
+            grid-template-columns: minmax(0, 1fr);
+            grid-template-areas:
+              "title"
+              "controls"
+              "help";
+            grid-template-rows: auto;
+            row-gap: 10px;
+          }
+
+          .top-controls {
+            justify-self: stretch;
             align-items: flex-start;
           }
 
-          .button-row {
+          .toolbar {
             justify-content: flex-start;
+            gap: 6px 10px;
           }
 
-          .slider-control {
-            width: min(280px, 100%);
+          .slider-panel {
+            width: min(460px, 100%);
+            grid-template-columns: repeat(2, minmax(0, 1fr));
           }
 
           .help {
-            top: 270px;
-            left: 18px;
-            right: 18px;
-            max-width: none;
+            max-width: 560px;
           }
         }
 
         @media (max-width: 620px) {
-          .subtitle {
-            display: none;
-          }
-
-          .top-left {
-            width: 55%;
-          }
-
-          .top-right {
-            top: 122px;
-          }
-
-          .help {
-            top: 270px;
-          }
-
           .field-legend {
             display: none;
           }
@@ -4834,6 +4656,36 @@ export default function App() {
             bottom: 85px;
           }
         }
+
+        @media (max-width: 440px) {
+          .toolbar-group {
+            gap: 5px;
+          }
+
+          .control,
+          .current-toggle {
+            padding: 7px 8px;
+            font-size: 11px;
+          }
+
+          .segment {
+            padding: 6px 8px;
+            font-size: 11px;
+          }
+
+          .current-toggle {
+            gap: 5px;
+          }
+
+          .help {
+            font-size: 10.5px;
+          }
+
+          .slider-panel {
+            gap: 14px;
+            padding: 10px 12px 11px;
+          }
+        }
       `}</style>
 
       <div className="magnetic-panel">
@@ -4854,160 +4706,140 @@ export default function App() {
           className="three-stage"
         />
 
-        <div className="hud top-left">
-          <div className="kicker">
-            Magnetism · 3D exploration
+        <div className="hud top-bar">
+          <div className="top-title">
+            <div className="kicker">
+              Magnetism · 3D exploration
+            </div>
+
+            <h1 className="title">
+              From straight wire to
+              solenoid
+            </h1>
           </div>
 
-          <h1 className="title">
-            From straight wire to
-            solenoid
-          </h1>
-        </div>
+          <div className="top-controls">
+            <div className="toolbar">
+              <div
+                className="toolbar-group"
+                role="group"
+                aria-label="Build the coil"
+              >
+                <button
+                  className="control"
+                  onClick={triggerUndo}
+                  disabled={!canUndo}
+                >
+                  Unwrap
+                </button>
 
-        <div className="hud top-right">
-          <div className="button-row">
+                <button
+                  className="control primary"
+                  onClick={triggerWrap}
+                  disabled={!canWrap}
+                >
+                  Wrap
+                </button>
+              </div>
 
-            <button
-              className="control"
-              onClick={triggerUndo}
-              disabled={!canUndo}
-            >
-              Unwrap
-            </button>
+              <div
+                className="toolbar-group"
+                role="group"
+                aria-label="Overlays"
+              >
+                <label className="current-toggle">
+                  <input
+                    type="checkbox"
+                    checked={showCurrent}
+                    onChange={handleCurrentToggle}
+                  />
+                  <span>Show current</span>
+                </label>
 
-            <button
-              className="control primary"
-              onClick={triggerWrap}
-              disabled={!canWrap}
-            >
-              Wrap
-            </button>
+                <label className="current-toggle">
+                  <input
+                    type="checkbox"
+                    checked={showPoles}
+                    onChange={handlePolesToggle}
+                  />
+                  <span>Show poles</span>
+                </label>
+              </div>
 
-            <label className="current-toggle">
-              <input
-                type="checkbox"
-                checked={showCurrent}
-                onChange={handleCurrentToggle}
+              <div
+                className="segmented"
+                role="group"
+                aria-label="Field view"
+              >
+                <button
+                  className={`segment ${
+                    mode === 'none' ? 'active' : ''
+                  }`}
+                  aria-pressed={mode === 'none'}
+                  onClick={triggerNoField}
+                >
+                  No field
+                </button>
+
+                <button
+                  className={`segment ${
+                    mode === 'combined' ? 'active' : ''
+                  }`}
+                  aria-pressed={mode === 'combined'}
+                  onClick={triggerCombined}
+                >
+                  Combined field
+                </button>
+
+                <button
+                  className={`segment multicolor ${
+                    mode === 'all' ? 'active' : ''
+                  }`}
+                  aria-pressed={mode === 'all'}
+                  onClick={triggerAllContributions}
+                >
+                  Contributions
+                </button>
+              </div>
+            </div>
+
+            <div className="slider-panel">
+              <SliderField
+                label="Coil pitch"
+                valueText={coilPitch.toFixed(3)}
+                value={coilPitch}
+                min={0.03}
+                max={0.3}
+                step={0.005}
+                onChange={handlePitchSliderChange}
               />
-              <span>Show current</span>
-            </label>
 
-            <label className="current-toggle">
-              <input
-                type="checkbox"
-                checked={showPoles}
-                onChange={handlePolesToggle}
+              <SliderField
+                label="Field lines"
+                valueText={combinedLineCount}
+                value={combinedLineCount}
+                min={4}
+                max={36}
+                step={2}
+                onChange={
+                  handleCombinedLineCountChange
+                }
+                disabled={mode !== 'combined'}
+                disabledHint="Only used in the Combined field view"
               />
-              <span>Show poles</span>
-            </label>
-
-            <button
-              className={`control ${
-                mode === 'none'
-                  ? 'active'
-                  : ''
-              }`}
-              aria-pressed={mode === 'none'}
-              onClick={triggerNoField}
-            >
-              No field
-            </button>
-
-            <button
-              className={`control ${
-                mode === 'combined'
-                  ? 'active'
-                  : ''
-              }`}
-              aria-pressed={mode === 'combined'}
-              onClick={triggerCombined}
-            >
-              Combined field
-            </button>
-
-            <button
-              className={`control multicolor ${
-                mode === 'all'
-                  ? 'active'
-                  : ''
-              }`}
-              aria-pressed={mode === 'all'}
-              onClick={
-                triggerAllContributions
-              }
-            >
-              Contributions to field
-            </button>
+            </div>
           </div>
 
-          <label
-            className="slider-control"
-            style={{
-              display: 'flex',
-              flexDirection: 'column',
-              gap: 6,
-            }}
-          >
-            <span>
-              Coil pitch: {coilPitch.toFixed(3)}
-            </span>
-
-            <input
-              type="range"
-              min="0.03"
-              max="0.30"
-              step="0.005"
-              value={coilPitch}
-              onChange={(e) => {
-                const value =
-                  Number(e.target.value);
-
-                setCoilPitch(value);
-
-                mountRef.current?._magneticTool
-                  ?.pitchChange(value);
-              }}
-            />
-          </label>
-
-          <label
-            className="slider-control"
-            style={{
-              display: 'flex',
-              flexDirection: 'column',
-              gap: 6,
-            }}
-          >
-            <span>
-              Combined field lines: {combinedLineCount}
-            </span>
-
-            <input
-              type="range"
-              min="4"
-              max="36"
-              step="2"
-              value={combinedLineCount}
-              onChange={
-                handleCombinedLineCountChange
-              }
-              disabled={mode !== 'combined'}
-              aria-label="Number of combined field lines"
-            />
-          </label>
-
-        </div>
-
-        <div className="help">
-          Drag = orbit · Wheel = zoom ·
-          Right-drag / hold arrows = pan ·
-          Shift+arrows = orbit · Click a
-          wrapped section = isolate its
-          field · Shift+click sections to
-          compare their fields ·
-          Click the progress bar
-          to jump to a section count
+          <div className="help">
+            Drag = orbit · Wheel = zoom ·
+            Right-drag / hold arrows = pan ·
+            Shift+arrows = orbit · Click a
+            wrapped section = isolate its
+            field · Shift+click sections to
+            compare their fields ·
+            Click the progress bar
+            to jump to a section count
+          </div>
         </div>
 
         <div className="direction-controls">
@@ -5057,7 +4889,7 @@ export default function App() {
                 }}
               >
                 <svg
-                  className="orbit-curve-arrow orbit-curve-left"
+                  className="orbit-curve-arrow"
                   viewBox="0 0 24 24"
                   aria-hidden="true"
                 >
@@ -5280,18 +5112,15 @@ export default function App() {
             'The magnetic field visualization is hidden.'}
         </div>
         
-        <div style={{ marginTop: 10 }}>
-          <FieldLegend
-            selectedSections={
-              selectedSections
-            }
-            wrappedCount={
-              wrappedCount
-            }
-            mode={mode}
-          />
-        </div>
-        
+        <FieldLegend
+          selectedSections={
+            selectedSections
+          }
+          wrappedCount={
+            wrappedCount
+          }
+          mode={mode}
+        />
       </div>
     </div>
   );
