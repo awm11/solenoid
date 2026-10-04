@@ -1,6 +1,16 @@
 import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { Line2 } from 'three/addons/lines/Line2.js';
+import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
+import { LineGeometry } from 'three/addons/lines/LineGeometry.js';
+import BuyMeCoffeeButton from './BuyMeCoffee.jsx';
+
+const SITE_URL = 'https://awm11.github.io/';
+
+// public/favicon.svg, resolved against the app's base path so it still
+// loads when the app is served from a sub-folder.
+const FAVICON_SRC = `${import.meta.env?.BASE_URL ?? '/'}favicon.svg`;
 
 /*
  * More, shorter sections.
@@ -32,6 +42,15 @@ const SECTION_CURVE_SAMPLES = 8;
 // Nth curve sample per section for the field sum (cheaper, slightly
 // coarser). The full-resolution field is rebuilt when the animation ends.
 const ANIMATED_FIELD_STRIDE = 2;
+
+// Combined-field line tracing.
+//   SEED_RADIUS_FRACTION keeps seeds inside the bore, clear of the winding.
+//   LINE_ARC is how far each line is drawn, in world units of arc length.
+//   LINE_FADE_FRACTION is how much of each end dissolves into the background.
+const SEED_RADIUS_FRACTION = 0.85;
+const LINE_ARC = 18;
+const LINE_STEP = 0.14;
+const LINE_FADE_FRACTION = 0.14;
 
 // Wrap/unwrap animation length grows gently with the number of sections
 // moved: one section takes WRAP_BASE_MS, each extra section adds
@@ -605,13 +624,14 @@ function buildCurrentElements(
   activeCount,
   stride = 1,
   weightOf = () => 1,
+  currentDirection = 1,
 ) {
   const values = [];
 
   for (let s = 0; s < activeCount; s++) {
-    const weight = weightOf(s);
+    const weight = weightOf(s) * currentDirection;
 
-    if (weight <= 0) {
+    if (weight === 0) {
       continue;
     }
 
@@ -667,58 +687,6 @@ function fieldAt(px, py, pz, elements, out) {
   }
 
   return out.set(bx, by, bz);
-}
-
-/*
- * Trace a field line through the combined field.
- */
-function traceCombinedStreamline(
-  seed,
-  directionSign,
-  elements,
-) {
-  const linePoints = [];
-  const p = seed.clone();
-  const b = new THREE.Vector3();
-
-  for (
-    let step = 0;
-    step < 150;
-    step++
-  ) {
-    linePoints.push(
-      p.clone(),
-    );
-
-    fieldAt(p.x, p.y, p.z, elements, b);
-
-    const magnitude =
-      b.length();
-
-    if (
-      !Number.isFinite(
-        magnitude,
-      ) ||
-      magnitude < 0.0005
-    ) {
-      break;
-    }
-
-    p.addScaledVector(
-      b,
-      (directionSign * 0.14) / magnitude,
-    );
-
-    if (
-      Math.abs(p.x) > 13 ||
-      Math.abs(p.y) > 10 ||
-      Math.abs(p.z) > 12
-    ) {
-      break;
-    }
-  }
-
-  return linePoints;
 }
 
 /*
@@ -792,11 +760,236 @@ function addStreamlineArrows(
 }
 
 /*
+ * Seed points for the combined-field view, chosen by magnetic flux.
+ *
+ * Each line should stand for the same amount of flux: that is the
+ * convention that makes line *density* mean field strength, so the
+ * picture reads the way a textbook diagram does.
+ *
+ * So instead of picking seed positions geometrically, measure the
+ * axial flux through the bore at the coil's mid-plane, then place
+ * seeds at the radii that cut that flux into `count` equal shares.
+ * Seeds stay inside `rMax` (just short of the winding), which also
+ * keeps them out of the near-field of individual turns, where a line
+ * corkscrews around one wire instead of showing the coil's field.
+ */
+function axialFluxSeeds(
+  elements,
+  axisX,
+  count,
+  rMax,
+  samples = 40,
+) {
+  const probe = new THREE.Vector3();
+  const radii = [0];
+  const cumulative = [0];
+  let total = 0;
+
+  for (let i = 1; i <= samples; i++) {
+    const inner = (rMax * (i - 1)) / samples;
+    const outer = (rMax * i) / samples;
+    const mid = (inner + outer) / 2;
+
+    /*
+     * A helix is not quite axisymmetric, so average the axial
+     * component over four azimuths at this radius.
+     */
+    let axial = 0;
+
+    for (let a = 0; a < 4; a++) {
+      const theta = (a * Math.PI) / 2;
+
+      fieldAt(
+        axisX,
+        Math.cos(theta) * mid,
+        COIL_RADIUS + Math.sin(theta) * mid,
+        elements,
+        probe,
+      );
+
+      axial += probe.x;
+    }
+
+    total +=
+      (axial / 4) *
+      2 *
+      Math.PI *
+      mid *
+      (outer - inner);
+
+    radii.push(outer);
+    cumulative.push(total);
+  }
+
+  const seeds = [];
+
+  if (!(Math.abs(total) > 1e-9)) {
+    return seeds;
+  }
+
+  const goldenAngle =
+    Math.PI * (3 - Math.sqrt(5));
+
+  for (let k = 0; k < count; k++) {
+    const target =
+      (total * (k + 0.5)) / count;
+
+    let i = 1;
+
+    while (
+      i < cumulative.length - 1 &&
+      Math.abs(cumulative[i]) <
+        Math.abs(target)
+    ) {
+      i++;
+    }
+
+    const span =
+      cumulative[i] - cumulative[i - 1];
+
+    const f =
+      span === 0
+        ? 0
+        : (target - cumulative[i - 1]) / span;
+
+    const radius =
+      radii[i - 1] +
+      (radii[i] - radii[i - 1]) *
+        Math.min(1, Math.max(0, f));
+
+    const angle = k * goldenAngle;
+
+    seeds.push(
+      new THREE.Vector3(
+        axisX,
+        Math.cos(angle) * radius,
+        COIL_RADIUS +
+          Math.sin(angle) * radius,
+      ),
+    );
+  }
+
+  return seeds;
+}
+
+/*
+ * Trace a field line for a fixed ARC LENGTH rather than a fixed number
+ * of steps, so the drawn length does not change with the step size.
+ *
+ * The length is capped because these trajectories are chaotic: two
+ * paths that start a hair apart separate fast, mostly when one of them
+ * grazes a turn of the winding. Measured against a finely integrated
+ * reference, a line is accurate to ~0.1 over the first few units and
+ * drifts past ~2 by arc 20, so drawing much beyond LINE_ARC would be
+ * drawing noise.
+ */
+function traceFieldLine(
+  seed,
+  directionSign,
+  elements,
+  arcMax = LINE_ARC,
+  step = LINE_STEP,
+) {
+  const linePoints = [];
+  const p = seed.clone();
+  const b = new THREE.Vector3();
+  let travelled = 0;
+
+  while (travelled < arcMax) {
+    linePoints.push(
+      p.clone(),
+    );
+
+    fieldAt(p.x, p.y, p.z, elements, b);
+
+    const magnitude =
+      b.length();
+
+    if (
+      !Number.isFinite(
+        magnitude,
+      ) ||
+      magnitude < 0.0005
+    ) {
+      break;
+    }
+
+    p.addScaledVector(
+      b,
+      (directionSign * step) / magnitude,
+    );
+
+    travelled += step;
+
+    if (
+      Math.abs(p.x) > 13 ||
+      Math.abs(p.y) > 10 ||
+      Math.abs(p.z) > 12
+    ) {
+      break;
+    }
+  }
+
+  return linePoints;
+}
+
+/*
+ * Per-vertex colours that fade both ends of a line into the
+ * background. A field line here is a slice of a longer curve, so a
+ * hard stop would read as the field ending; fading reads as
+ * "continues beyond".
+ */
+function fadedLineColors(
+  points,
+  color,
+) {
+  const base =
+    new THREE.Color(color);
+
+  const bg =
+    new THREE.Color(0x06090f);
+
+  const fade =
+    Math.max(
+      2,
+      Math.round(
+        points.length * LINE_FADE_FRACTION,
+      ),
+    );
+
+  const colors =
+    new Float32Array(points.length * 3);
+
+  const mixed = new THREE.Color();
+
+  for (let i = 0; i < points.length; i++) {
+    const edge =
+      Math.min(
+        i,
+        points.length - 1 - i,
+      );
+
+    const t =
+      Math.min(1, edge / fade);
+
+    mixed
+      .copy(bg)
+      .lerp(base, 0.15 + 0.85 * t);
+
+    colors[i * 3] = mixed.r;
+    colors[i * 3 + 1] = mixed.g;
+    colors[i * 3 + 2] = mixed.b;
+  }
+
+  return { colors, fade };
+}
+
+/*
  * Combined-field view.
  *
  * options:
- *   pitch     - coil pitch, used to place seeds along the finished helix
- *   seedSpan  - how many sections' worth of coil to spread seeds over
+ *   pitch     - coil pitch, used to find the wrapped coil's mid-plane
+ *   seedSpan  - how many sections' worth of coil is wrapped
  *               (may be fractional mid-animation; defaults to activeCount)
  *   stride    - curve-sample stride for the field sum (see above)
  *   weightOf  - per-section current weight (see above)
@@ -810,6 +1003,8 @@ function buildCombinedField(
     seedSpan = activeCount,
     stride = 1,
     weightOf,
+    currentDirection = 1,
+    resolution = new THREE.Vector2(800, 600),
   } = {},
 ) {
   const group =
@@ -825,55 +1020,28 @@ function buildCombinedField(
       activeCount,
       stride,
       weightOf,
+      currentDirection,
     );
+
+  const count = Math.max(1, Math.round(lineCount));
 
   /*
-   * Seed the requested number of lines at evenly-spaced axial positions
-   * and around the coil axis.  Alternating inner/outer seed radii gives
-   * the combined field a useful mix of lines through the solenoid and
-   * return lines outside it, while the golden-angle rotation avoids the
-   * visible three-cluster pattern of the old fixed seed set.
-   *
-   * Seeds are spread continuously along the finished helix (not
-   * snapped to section centres), so as `seedSpan` changes during a wrap
-   * every seed slides smoothly on every frame instead of stepping a
-   * whole section at a time.
+   * Mid-plane of the wrapped portion of the coil. During a wrap this
+   * slides along with the coil, so the seeds follow it smoothly.
    */
-  const seeds = [];
-  const count = Math.max(1, Math.round(lineCount));
-  const axisCenterZ = COIL_RADIUS;
-  const goldenAngle =
-    Math.PI * (3 - Math.sqrt(5));
+  const axisX =
+    coilPointAt(
+      (0.5 * seedSpan) / SECTION_COUNT,
+      pitch,
+    ).x;
 
-  for (let i = 0; i < count; i++) {
-    const axialFraction =
-      count === 1
-        ? 0.5
-        : (i + 0.5) / count;
-
-    const centerX =
-      coilPointAt(
-        (axialFraction * seedSpan) / SECTION_COUNT,
-        pitch,
-      ).x;
-
-    const angle =
-      i * goldenAngle;
-
-    const radius =
-      i % 2 === 0
-        ? Math.min(1.35, COIL_RADIUS * 0.72)
-        : COIL_RADIUS + 0.85;
-
-    seeds.push(
-      new THREE.Vector3(
-        centerX,
-        Math.cos(angle) * radius,
-        axisCenterZ +
-          Math.sin(angle) * radius,
-      ),
+  const seeds =
+    axialFluxSeeds(
+      elements,
+      axisX,
+      count,
+      COIL_RADIUS * SEED_RADIUS_FRACTION,
     );
-  }
 
   const colors = [
     0x4de4ff,
@@ -884,14 +1052,14 @@ function buildCombinedField(
   seeds.forEach(
     (seed, seedIndex) => {
       const forward =
-        traceCombinedStreamline(
+        traceFieldLine(
           seed,
           1,
           elements,
         );
 
       const backward =
-        traceCombinedStreamline(
+        traceFieldLine(
           seed,
           -1,
           elements,
@@ -906,40 +1074,63 @@ function buildCombinedField(
         return;
       }
 
-      const geometry =
-        new THREE.BufferGeometry()
-          .setFromPoints(
-            traced,
-          );
-
       const color =
         colors[
           seedIndex %
             colors.length
         ];
 
-      const material =
-        new THREE.LineBasicMaterial({
+      const { colors: vertexColors, fade } =
+        fadedLineColors(
+          traced,
           color,
-          transparent: true,
-          opacity: 0.45,
-          depthWrite: false,
-        });
+        );
 
-      group.add(
-        new THREE.Line(
-          geometry,
-          material,
-        ),
+      // Flat position array for LineGeometry
+      const positions = new Float32Array(
+        traced.length * 3,
       );
+      for (let i = 0; i < traced.length; i++) {
+        positions[i * 3]     = traced[i].x;
+        positions[i * 3 + 1] = traced[i].y;
+        positions[i * 3 + 2] = traced[i].z;
+      }
 
+      const geometry = new LineGeometry();
+      geometry.setPositions(positions);
+      geometry.setColors(vertexColors);
+
+      const material = new LineMaterial({
+        color: 0xffffff,
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.62,
+        depthWrite: false,
+        linewidth: 2,
+        resolution,
+      });
+
+      group.add(new Line2(geometry, material));
+
+      /*
+       * Arrows only along the part of the line that is fully
+       * drawn, so none appear floating in the faded ends.
+       */
+      /*
+       * Arrows are spaced out because line density now carries the
+       * field strength; they only need to show direction. They are
+       * kept off the faded ends so none float in mid-air.
+       */
       addStreamlineArrows(
         group,
-        traced,
+        traced.slice(
+          fade,
+          traced.length - fade,
+        ),
         color,
-        12,
-        0.24,
-        0.10,
+        26,
+        0.22,
+        0.09,
         0.8,
       );
     },
@@ -1050,11 +1241,33 @@ function buildAllContributionsField(
 }
 
 /*
+ * Colours for isolated sections, in selection order. The first is the
+ * familiar pink, so shift-clicking a second section never recolours
+ * the first; none of them is close to the orange of wound wire.
+ */
+const SELECTION_COLORS = [
+  0xff76da,
+  0x6cf08c,
+  0xffe066,
+  0x55a8ff,
+  0xb875ff,
+  0xff8b5f,
+];
+
+function selectionColor(order) {
+  return SELECTION_COLORS[order % SELECTION_COLORS.length];
+}
+
+const toCssColor = (hex) =>
+  `#${hex.toString(16).padStart(6, '0')}`;
+
+/*
  * Isolated field for currently-selected section(s).
  */
 function buildSectionField(
   sectionPaths,
   sectionIndices,
+  currentDirection = 1,
 ) {
   const group =
     new THREE.Group();
@@ -1074,7 +1287,10 @@ function buildSectionField(
   }
 
   validIndices.forEach(
-    (sectionIndex) => {
+    (sectionIndex, order) => {
+      const color =
+        selectionColor(order);
+
       const sectionPath =
         sectionPaths[
           sectionIndex
@@ -1113,7 +1329,7 @@ function buildSectionField(
               center,
               tangent,
               radius,
-              0xff76da,
+              color,
               0.78 -
                 idx * 0.11,
               72,
@@ -1122,17 +1338,22 @@ function buildSectionField(
         },
       );
 
+      const arrowDir =
+        tangent.clone().multiplyScalar(currentDirection);
+
       const arrow =
         new THREE.ArrowHelper(
-          tangent,
+          arrowDir,
           center
             .clone()
             .addScaledVector(
-              tangent,
+              arrowDir,
               -0.2,
             ),
           0.85,
-          0xff9ce7,
+          validIndices.length > 1
+            ? color
+            : 0xff9ce7,
           0.18,
           0.11,
         );
@@ -1278,12 +1499,42 @@ function FieldLegend({
       'The magnetic field visualization is hidden';
   }
 
+  // Several isolated sections: one row each, in that section's colour.
+  const selectionRows =
+    mode === 'individual' &&
+    (selectedSections || []).length > 1
+      ? selectedSections.map((sectionIndex, order) => ({
+          sectionIndex,
+          color: toCssColor(
+            selectionColor(order),
+          ),
+        }))
+      : null;
+
+  if (selectionRows) {
+    title =
+      selectionRows.length === 2
+        ? `Fields from sections ${selectionRows[0].sectionIndex + 1} & ${selectionRows[1].sectionIndex + 1}`
+        : `Fields from ${selectionRows.length} sections`;
+  }
+
   return (
     <div className="field-legend">
       <div className="legend-title">
         {title}
       </div>
 
+      {selectionRows ? (
+        selectionRows.map(({ sectionIndex, color }) => (
+          <div className="legend-row" key={sectionIndex}>
+            <span
+              className="legend-dot"
+              style={{ background: color, color }}
+            />
+            <span>Section {sectionIndex + 1}</span>
+          </div>
+        ))
+      ) : (
       <div className="legend-row">
         <span
           className={`legend-dot ${
@@ -1301,11 +1552,16 @@ function FieldLegend({
           {description}
         </span>
       </div>
+      )}
     </div>
   );
 }
 
-export default function App() {
+/*
+ * The 3D screen. It stays mounted while the cross-section is showing,
+ * so its coil, camera and selection survive a trip to the other view.
+ */
+function CoilView({ switcher }) {
   const mountRef =
     useRef(null);
 
@@ -1331,12 +1587,21 @@ export default function App() {
   const [showPoles, setShowPoles] =
     useState(false);
 
+  // The progress bar pulses on load until the visitor first uses it.
+  const [barAttention, setBarAttention] =
+    useState(true);
+
+  const [currentReversed, setCurrentReversed] =
+    useState(false);
+
   const stateRef =
     useRef({
       wrappedCount: 0,
       selectedSections: [],
       mode: 'combined',
       combinedLineCount: 18,
+      currentDirection: 1,
+      showPoles: false,
     });
 
   const [coilPitch, setCoilPitch] =
@@ -1363,6 +1628,9 @@ export default function App() {
   stateRef.current.combinedLineCount =
     combinedLineCount;
 
+  stateRef.current.currentDirection =
+    currentReversed ? -1 : 1;
+
   useEffect(() => {
     const mount =
       mountRef.current;
@@ -1376,7 +1644,7 @@ export default function App() {
 
     scene.background =
       new THREE.Color(
-        0x07111b,
+        0x06090f,
       );
 
     const camera =
@@ -1388,9 +1656,9 @@ export default function App() {
       );
 
     camera.position.set(
-      10.5,
-      8.2,
-      12.5,
+      11.0,
+      5.95,
+      19.25,
     );
 
     let renderer;
@@ -1435,6 +1703,14 @@ export default function App() {
       mount.clientWidth,
       mount.clientHeight,
     );
+
+    // Shared resolution vector for LineMaterial (thick field lines).
+    // Must match the renderer's pixel size and be updated on resize.
+    const lineMaterialResolution =
+      new THREE.Vector2(
+        mount.clientWidth,
+        mount.clientHeight,
+      );
 
     renderer.outputColorSpace =
       THREE.SRGBColorSpace;
@@ -1499,9 +1775,30 @@ export default function App() {
         0x112333,
       );
 
-    grid.position.y = -3.25;
+    grid.position.y = -5.0;
 
     scene.add(grid);
+
+    /*
+     * Translucent floor pane sitting just below the grid lines so
+     * the grid reads as lines drawn on a surface rather than floating
+     * in space.  The slight blue tint matches the scene's colour key.
+     */
+    const floorMesh =
+      new THREE.Mesh(
+        new THREE.PlaneGeometry(30, 30),
+        new THREE.MeshBasicMaterial({
+          color: 0x04060b,
+          transparent: true,
+          opacity: 0.62,
+          depthWrite: false,
+        }),
+      );
+
+    floorMesh.rotation.x = -Math.PI / 2;
+    floorMesh.position.y = -5.01;
+
+    scene.add(floorMesh);
 
     const axisMaterial =
       new THREE.LineBasicMaterial({
@@ -1560,82 +1857,296 @@ export default function App() {
     root.add(pulseGroup);
     root.add(poleGroup);
 
-    function createPoleLabel(
-      text,
-      color,
+    /*
+     * Multiply a #rrggbb colour toward black. factor < 1 darkens.
+     */
+    function shade(hex, factor) {
+      const n = parseInt(hex.slice(1), 16);
+
+      const channel = (shift) =>
+        Math.max(
+          0,
+          Math.min(
+            255,
+            Math.round(((n >> shift) & 255) * factor),
+          ),
+        );
+
+      return (
+        '#' +
+        [16, 8, 0]
+          .map((s) =>
+            channel(s)
+              .toString(16)
+              .padStart(2, '0'),
+          )
+          .join('')
+      );
+    }
+
+    function createPoleBadge(
+      letter,
+      fillColor,
+      borderColor,
     ) {
+      const SIZE = 320;
       const canvas =
         document.createElement('canvas');
+      canvas.width = SIZE;
+      canvas.height = SIZE;
 
-      canvas.width = 320;
-      canvas.height = 96;
+      const ctx = canvas.getContext('2d');
+      const cx = SIZE / 2;
+      const cy = SIZE / 2;
 
-      const context =
-        canvas.getContext('2d');
+      /*
+       * Opaque disk behind the glyph, so the badge reads as a solid
+       * object rather than a decal floating over the field lines.
+       * Everything outside the disk stays transparent.
+       */
+      const diskR = SIZE / 2 - 4;
 
-      context.font =
-        '700 32px sans-serif';
-      context.textAlign = 'center';
-      context.textBaseline = 'middle';
-      context.fillStyle = color;
-      context.fillText(
-        text,
-        canvas.width / 2,
-        canvas.height / 2,
-      );
+      ctx.beginPath();
+      ctx.arc(cx, cy, diskR, 0, Math.PI * 2);
+      ctx.fillStyle = '#0b1018';
+      ctx.fill();
+
+      ctx.beginPath();
+      ctx.arc(cx, cy, diskR - 2, 0, Math.PI * 2);
+      ctx.strokeStyle = borderColor;
+      ctx.lineWidth = 4;
+      ctx.globalAlpha = 0.55;
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+
+      /*
+       * Both letters share one construction, taken from the standard
+       * end-view convention:
+       *
+       *   - a straight diagonal through the centre, from A to the
+       *     diametrically opposite B,
+       *   - a circular arc leaving A and another leaving B, each
+       *     sweeping ~122 degrees around the letter circle,
+       *   - an arrowhead on the open end of each arc.
+       *
+       * N sweeps anticlockwise (current toward the viewer), S sweeps
+       * clockwise (current away). That is the whole difference — the
+       * two glyphs are the same figure run in opposite directions.
+       */
+      const R = 88;
+      const ccw = letter === 'N';
+      const startDeg = ccw ? 137 : 153;
+      const sweepDeg = ccw ? 122 : -122;
+
+      const DEG = Math.PI / 180;
+
+      // Math-convention angle (anticlockwise, y up) -> canvas point.
+      function at(deg, radius = R) {
+        return [
+          cx + radius * Math.cos(deg * DEG),
+          cy - radius * Math.sin(deg * DEG),
+        ];
+      }
+
+      ctx.strokeStyle = fillColor;
+      ctx.lineWidth = Math.round(R * 0.115);
+      ctx.lineCap = 'butt';
+      ctx.lineJoin = 'round';
+
+      /*
+       * Arrowhead as a filled isosceles triangle: apex at the tip,
+       * base square to the direction of travel. Takes whichever
+       * stroke colour is current, so each head matches its stroke.
+       */
+      function arrowhead(tipX, tipY, dirDeg, len) {
+        const dir = dirDeg * DEG;
+
+        // Unit vector along travel (canvas y grows downward).
+        const dx = Math.cos(dir);
+        const dy = -Math.sin(dir);
+
+        // Perpendicular, for the two base corners.
+        const px = -dy;
+        const py = dx;
+
+        const halfBase = len * 0.46;
+        const baseX = tipX - len * dx;
+        const baseY = tipY - len * dy;
+
+        ctx.fillStyle = ctx.strokeStyle;
+        ctx.beginPath();
+        ctx.moveTo(tipX, tipY);
+        ctx.lineTo(
+          baseX + px * halfBase,
+          baseY + py * halfBase,
+        );
+        ctx.lineTo(
+          baseX - px * halfBase,
+          baseY - py * halfBase,
+        );
+        ctx.closePath();
+        ctx.fill();
+      }
+
+      // Arc drawn as a polyline so the sweep direction stays explicit.
+      function sweepArc(fromDeg, deltaDeg, radius) {
+        const steps = 56;
+        ctx.beginPath();
+        for (let i = 0; i <= steps; i++) {
+          const [x, y] = at(
+            fromDeg + (deltaDeg * i) / steps,
+            radius,
+          );
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+      }
+
+      const aDeg = startDeg;
+      const bDeg = startDeg + 180;
+
+      /*
+       * The straight diagonal: a diameter from A to B. Drawn a little
+       * thinner than the arcs, and in the brighter tone, so the two
+       * parts of the glyph read apart from each other.
+       */
+      const [ax, ay] = at(aDeg);
+      const [bx, by] = at(bDeg);
+      ctx.lineWidth = Math.round(R * 0.065);
+      ctx.beginPath();
+      ctx.moveTo(ax, ay);
+      ctx.lineTo(bx, by);
+      ctx.stroke();
+
+      // The two arcs, each curling off one end of the diagonal,
+      // in a deeper shade of the pole colour.
+      ctx.strokeStyle = shade(fillColor, 0.52);
+      ctx.lineWidth = Math.round(R * 0.13);
+
+      sweepArc(aDeg, sweepDeg, R);
+      sweepArc(bDeg, sweepDeg, R);
+
+      // Arrowheads on the open end of each arc, along the tangent.
+      const headLen = R * 0.34;
+      for (const endDeg of [aDeg + sweepDeg, bDeg + sweepDeg]) {
+        const [tx, ty] = at(endDeg);
+        const tangent = endDeg + (ccw ? 90 : -90);
+        arrowhead(tx, ty, tangent, headLen);
+      }
+
+      /*
+       * The dashed ring outside the letter repeats the same sense of
+       * rotation, so the glyph and the current agree at a glance.
+       */
+      const ringR = R * 1.3;
+      ctx.strokeStyle = borderColor;
+      ctx.lineWidth = Math.round(R * 0.075);
+      ctx.setLineDash([R * 0.17, R * 0.12]);
+      ctx.beginPath();
+      ctx.arc(cx, cy, ringR, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      for (const markDeg of [135, 315]) {
+        const [tx, ty] = at(markDeg, ringR);
+        const tangent = markDeg + (ccw ? 90 : -90);
+        arrowhead(tx, ty, tangent, R * 0.32);
+      }
 
       const texture =
         new THREE.CanvasTexture(canvas);
+      texture.anisotropy = 8;
 
-      const label =
-        new THREE.Sprite(
-          new THREE.SpriteMaterial({
+      /*
+       * The reverse: just the letter, plainly set. Seen from behind
+       * the coil the badge is only there to say which end this is,
+       * so it carries none of the current detail and sits smaller.
+       */
+      const backCanvas =
+        document.createElement('canvas');
+      backCanvas.width = SIZE;
+      backCanvas.height = SIZE;
+
+      const bctx = backCanvas.getContext('2d');
+
+      bctx.beginPath();
+      bctx.arc(cx, cy, diskR, 0, Math.PI * 2);
+      bctx.fillStyle = '#0b1018';
+      bctx.fill();
+
+      bctx.beginPath();
+      bctx.arc(cx, cy, diskR - 2, 0, Math.PI * 2);
+      bctx.strokeStyle = borderColor;
+      bctx.lineWidth = 4;
+      bctx.globalAlpha = 0.55;
+      bctx.stroke();
+      bctx.globalAlpha = 1;
+
+      bctx.font =
+        '700 150px system-ui, -apple-system, sans-serif';
+      bctx.textAlign = 'center';
+      bctx.textBaseline = 'middle';
+      bctx.fillStyle = fillColor;
+      bctx.fillText(letter, cx, cy + 6);
+
+      const backTexture =
+        new THREE.CanvasTexture(backCanvas);
+      backTexture.anisotropy = 8;
+
+      /*
+       * Two single-sided planes back to back rather than one
+       * double-sided one, so each face can carry its own artwork and
+       * its own size. Meshes, not sprites: a sprite is always a full
+       * billboard, and the badge is only allowed to turn part of the
+       * way toward the camera (see the clamp in the animation loop).
+       */
+      const badge = new THREE.Group();
+
+      const front =
+        new THREE.Mesh(
+          new THREE.PlaneGeometry(2.4, 2.4),
+          new THREE.MeshBasicMaterial({
             map: texture,
             transparent: true,
-            depthTest: false,
+            depthTest: true,
+            side: THREE.FrontSide,
           }),
         );
 
-      label.scale.set(1.35, 0.4, 1);
-      label.renderOrder = 7;
-      poleGroup.add(label);
-      return label;
+      const back =
+        new THREE.Mesh(
+          new THREE.PlaneGeometry(1.5, 1.5),
+          new THREE.MeshBasicMaterial({
+            map: backTexture,
+            transparent: true,
+            depthTest: true,
+            side: THREE.FrontSide,
+          }),
+        );
+
+      // Turned to face the other way, which also un-mirrors it.
+      back.rotation.y = Math.PI;
+
+      // A hair apart so the two never fight for the same depth.
+      front.position.z = 0.002;
+      back.position.z = -0.002;
+
+      badge.add(front);
+      badge.add(back);
+
+      poleGroup.add(badge);
+      return badge;
     }
 
-    const poleMarkers = [
-      {
-        color: 0xff5c70,
-        label: createPoleLabel(
-          'north',
-          '#ff9aa6',
-        ),
-      },
-      {
-        color: 0x4da6ff,
-        label: createPoleLabel(
-          'south',
-          '#8bc9ff',
-        ),
-      },
-    ].map(({ color, label }) => {
-      const marker =
-        new THREE.Mesh(
-          new THREE.SphereGeometry(
-            0.52,
-            16,
-            12,
-          ),
-          new THREE.MeshBasicMaterial({
-            color,
-            transparent: true,
-            opacity: 0.92,
-          }),
-        );
+    // How far a pole badge may swivel from facing straight out
+    // along the coil axis.
+    const POLE_MAX_TURN = THREE.MathUtils.degToRad(20);
 
-      poleGroup.add(marker);
-      marker.userData.label = label;
-      return marker;
-    });
+    const poleMarkers = [
+      createPoleBadge('N', '#ff2231', '#ff3a46'),
+      createPoleBadge('S', '#1f6bff', '#3b81ff'),
+    ];
 
     poleGroup.visible = false;
 
@@ -1762,21 +2273,46 @@ export default function App() {
             )
             .multiplyScalar(0.5);
 
-        poleMarkers[1].position.set(
-          firstEndpoint.x - 0.55,
-          axisCenter.y,
-          axisCenter.z + 3.2,
-        );
-        poleMarkers[0].position.set(
-          lastWrappedEndpoint.x + 0.55,
-          axisCenter.y,
-          axisCenter.z + 3.2,
-        );
+        /*
+         * poleMarkers[0] is always the north sphere (red).
+         * poleMarkers[1] is always the south sphere (blue).
+         * Standard current direction: north at the lastWrapped end,
+         * south at the first end.  When reversed, swap the ends.
+         */
+        const reversed =
+          stateRef.current.currentDirection === -1;
 
-        poleMarkers[0].userData.label.position
-          .copy(poleMarkers[0].position);
-        poleMarkers[1].userData.label.position
-          .copy(poleMarkers[1].position);
+        const northEnd = reversed ? firstEndpoint : lastWrappedEndpoint;
+        const southEnd = reversed ? lastWrappedEndpoint : firstEndpoint;
+
+        /*
+         * Each badge caps one end of the wound section, centred on the
+         * coil's central axis (y = 0, z = COIL_RADIUS, which is what
+         * the helix in coilPoint winds around).
+         *
+         * The outward direction is taken from the two ends relative to
+         * each other, not to the full coil's midpoint: while wrapping
+         * is part-way through, both ends can sit on the same side of
+         * that midpoint, which would put both badges at one end.
+         */
+        const midX =
+          (northEnd.x + southEnd.x) / 2;
+
+        const northSign =
+          Math.sign(northEnd.x - midX) || 1;
+
+        [
+          [poleMarkers[0], northEnd, northSign],
+          [poleMarkers[1], southEnd, -northSign],
+        ].forEach(([badge, end, sign]) => {
+          badge.userData.outwardSign = sign;
+
+          badge.position.set(
+            end.x + sign * 0.85,
+            0,
+            COIL_RADIUS,
+          );
+        });
       }
 
       const selections =
@@ -1814,22 +2350,28 @@ export default function App() {
         const isSelected =
           selections.includes(i);
 
+        // A selected section wears the same colour as its field.
+        const selectedColor =
+          isSelected
+            ? selectionColor(selections.indexOf(i))
+            : null;
+
         const wireMaterial =
           new THREE.MeshStandardMaterial({
             color: isSelected
-              ? 0xff76da
+              ? selectedColor
               : isWrapped
                 ? 0xffa15b
                 : 0xe8f5ff,
 
             emissive:
-              new THREE.Color(
-                isSelected
-                  ? 0x5c154f
-                  : isWrapped
-                    ? 0x3a1a08
-                    : 0x173042,
-              ),
+              isSelected
+                ? new THREE.Color(selectedColor).multiplyScalar(0.36)
+                : new THREE.Color(
+                    isWrapped
+                      ? 0x3a1a08
+                      : 0x173042,
+                  ),
 
             emissiveIntensity:
               isSelected
@@ -1889,7 +2431,7 @@ export default function App() {
                 sectionPath,
                 0.16,
                 new THREE.MeshBasicMaterial({
-                  color: 0xff76da,
+                  color: selectedColor,
                   transparent: true,
                   opacity: 0.18,
                   depthWrite: false,
@@ -1908,7 +2450,7 @@ export default function App() {
                 ],
                 0.16,
                 new THREE.MeshBasicMaterial({
-                  color: 0xff76da,
+                  color: selectedColor,
                   transparent: true,
                   opacity: 0.18,
                   depthWrite: false,
@@ -1957,7 +2499,8 @@ export default function App() {
               after,
               before,
             )
-            .normalize();
+            .normalize()
+            .multiplyScalar(stateRef.current.currentDirection);
 
         const arrow =
           new THREE.ArrowHelper(
@@ -2074,7 +2617,11 @@ export default function App() {
           sectionPaths,
           activeCount,
           stateRef.current.combinedLineCount,
-          { pitch: coilPitchRef.current },
+          {
+            pitch: coilPitchRef.current,
+            currentDirection: stateRef.current.currentDirection,
+            resolution: lineMaterialResolution,
+          },
         ),
       );
 
@@ -2090,6 +2637,7 @@ export default function App() {
         buildSectionField(
           sectionPaths,
           activeSelections,
+          stateRef.current.currentDirection,
         ),
       );
 
@@ -2136,6 +2684,8 @@ export default function App() {
               stride: ANIMATED_FIELD_STRIDE,
               weightOf: (i) =>
                 i < low ? 1 : changingWeight,
+              currentDirection: stateRef.current.currentDirection,
+              resolution: lineMaterialResolution,
             },
           ),
         );
@@ -2150,6 +2700,7 @@ export default function App() {
           buildSectionField(
             sectionPaths,
             selectedSections,
+            stateRef.current.currentDirection,
           ),
         );
       }
@@ -2507,6 +3058,29 @@ export default function App() {
         );
 
       rebuildAll(paths);
+    }
+
+    function handleReverseCurrentDirection(
+      reversed,
+    ) {
+      stateRef.current.currentDirection =
+        reversed ? -1 : 1;
+
+      /*
+       * Rebuild fields so arrows flip.
+       * Wire rebuild is also needed to update pole positions.
+       */
+      rebuildFields(
+        state.sectionPaths,
+        stateRef.current.wrappedCount,
+        stateRef.current.selectedSections,
+      );
+
+      rebuildWire(
+        state.sectionPaths,
+        stateRef.current.wrappedCount,
+        stateRef.current.selectedSections,
+      );
     }
 
     function handleCombinedLineCountChange(
@@ -2881,6 +3455,11 @@ export default function App() {
     function onKeyDown(event) {
       const target = event.target;
 
+      // Arrow keys belong to whichever screen is showing.
+      if (mount.offsetParent === null) {
+        return;
+      }
+
       if (
         target instanceof HTMLElement &&
         (
@@ -2968,6 +3547,11 @@ export default function App() {
       const height =
         mount.clientHeight;
 
+      // Hidden behind the other screen: keep the last good size.
+      if (!width || !height) {
+        return;
+      }
+
       camera.aspect =
         width /
         Math.max(height, 1);
@@ -2978,6 +3562,8 @@ export default function App() {
         width,
         height,
       );
+
+      lineMaterialResolution.set(width, height);
     }
 
     const resizeObserver =
@@ -3001,6 +3587,12 @@ export default function App() {
         requestAnimationFrame(
           animate,
         );
+
+      // Nothing to draw while the cross-section screen is showing.
+      if (mount.offsetParent === null) {
+        previousFrameTime = 0;
+        return;
+      }
 
       const deltaSeconds =
         previousFrameTime
@@ -3309,6 +3901,10 @@ export default function App() {
           stateRef.current.wrappedCount =
             animationTo;
 
+          poleGroup.visible =
+            stateRef.current.showPoles &&
+            animationTo >= 16;
+
           const stillValid =
             stateRef.current
               .selectedSections.filter(
@@ -3372,12 +3968,14 @@ export default function App() {
             return;
           }
 
+          const dir = stateRef.current.currentDirection;
+          const TAU = Math.PI * 2;
           const pulsePosition =
-            (
-              now * 0.0022 -
-              marker.userData.pulsePhase
-            ) %
-            (Math.PI * 2);
+            ((now * 0.0022 * dir -
+              marker.userData.pulsePhase) %
+              TAU +
+              TAU) %
+            TAU;
 
           const pulseWidth =
             0.9;
@@ -3397,6 +3995,54 @@ export default function App() {
           }
         },
       );
+
+      /*
+       * Pole badges turn toward the camera, but only up to
+       * POLE_MAX_TURN from their rest facing of +Z. Past that they
+       * stop, so an orbit round the back leaves them edge-on rather
+       * than spinning to follow.
+       */
+      if (poleGroup.visible) {
+        for (const badge of poleMarkers) {
+          /*
+           * Rest facing is straight out along the coil axis, away from
+           * the winding: yaw of +90 deg at the +X end, -90 at the -X
+           * end, level in pitch. The badge turns from there toward the
+           * camera, but no further than POLE_MAX_TURN on either axis.
+           */
+          const restYaw =
+            (badge.userData.outwardSign || 1) *
+            (Math.PI / 2);
+
+          const toCamera =
+            camera.position
+              .clone()
+              .sub(badge.position);
+
+          // Wrap into [-PI, PI] so an orbit past the back of the
+          // scene turns the short way rather than unwinding.
+          const wrap = (a) =>
+            Math.atan2(
+              Math.sin(a),
+              Math.cos(a),
+            );
+
+          const yaw =
+            restYaw +
+            THREE.MathUtils.clamp(
+              wrap(
+                Math.atan2(toCamera.x, toCamera.z) -
+                  restYaw,
+              ),
+              -POLE_MAX_TURN,
+              POLE_MAX_TURN,
+            );
+
+          // Yaw only: the badge stays upright and never tips to
+          // follow the camera's height.
+          badge.rotation.set(0, yaw, 0, 'YXZ');
+        }
+      }
 
       controls.update();
 
@@ -3419,7 +4065,10 @@ export default function App() {
 
       showPoles:
         (visible) => {
-          poleGroup.visible = visible;
+          stateRef.current.showPoles = visible;
+          poleGroup.visible =
+            visible &&
+            stateRef.current.wrappedCount >= 16;
         },
 
       wrapNext:
@@ -3470,6 +4119,9 @@ export default function App() {
 
       combinedLineCountChange:
         handleCombinedLineCountChange,
+
+      reverseCurrentDirection:
+        handleReverseCurrentDirection,
     };
 
     return () => {
@@ -3572,6 +4224,18 @@ export default function App() {
         ?.showPoles(visible);
     };
 
+  // One click flips the current, whichever way it is flowing.
+  const handleCurrentReverseToggle =
+    () => {
+      const reversed =
+        !currentReversed;
+
+      setCurrentReversed(reversed);
+
+      mountRef.current?._magneticTool
+        ?.reverseCurrentDirection(reversed);
+    };
+
   const triggerCombined = () =>
     mountRef.current?._magneticTool?.combined();
 
@@ -3657,6 +4321,20 @@ export default function App() {
       );
     };
 
+  const modeCaption = {
+    combined:
+      'Blue field lines show the superposed field from every wrapped section.',
+    all:
+      'Every section has its own independently rendered, color-coded field.',
+    individual:
+      selectedSections.length > 1
+        ? `${selectedSections.length} sections are isolated — each one's field is drawn in its own colour.`
+        : `Section ${
+            (selectedSections[0] ?? 0) + 1
+          } is isolated — pink field lines show only its contribution.`,
+    none: 'The magnetic field visualization is hidden.',
+  }[mode];
+
   return (
     <div className="magnetic-app">
       <style>{`
@@ -3673,16 +4351,16 @@ export default function App() {
           place-items: center;
           background:
             radial-gradient(
-              circle at 18% 8%,
-              rgba(38, 121, 158, 0.18),
+              circle at 12% 6%,
+              rgba(20, 70, 160, 0.18),
               transparent 32%
             ),
             radial-gradient(
-              circle at 82% 92%,
-              rgba(114, 55, 122, 0.12),
+              circle at 88% 94%,
+              rgba(10, 50, 120, 0.12),
               transparent 34%
             ),
-            #030910;
+            #04060e;
           color: #edf9ff;
           font-family:
             Inter,
@@ -3709,7 +4387,7 @@ export default function App() {
           border: 1px solid
             rgba(145, 211, 239, 0.15);
           border-radius: 22px;
-          background: #07111b;
+          background: #05080d;
           box-shadow:
             0 30px 90px
               rgba(0, 0, 0, 0.42),
@@ -3744,16 +4422,24 @@ export default function App() {
          * overlap: wide screens put the controls in a right-hand column,
          * narrow screens stack everything in one column.
          */
+        /*
+         * On wide screens the bar runs to the bottom of the panel so
+         * the coffee button can take the bottom-left cell; it passes
+         * pointer events through everywhere but its controls.
+         */
         .top-bar {
           top: 20px;
           left: 22px;
           right: 20px;
+          bottom: 20px;
           display: grid;
           grid-template-columns: minmax(300px, 1fr) auto;
           grid-template-areas:
-            "title controls"
-            "help  controls";
-          grid-template-rows: auto 1fr;
+            "title  controls"
+            "help   controls"
+            ".      ."
+            "bottom bottom";
+          grid-template-rows: auto auto 1fr auto;
           column-gap: 24px;
           row-gap: 12px;
           align-items: start;
@@ -3881,6 +4567,110 @@ export default function App() {
           width: 15px;
           height: 15px;
           margin: 0;
+        }
+
+        /* Reverse current: a one-shot action, not an on/off state. */
+        .reverse-button {
+          font: inherit;
+          font-size: 12px;
+          font-weight: 800;
+          transition:
+            transform .15s ease,
+            border-color .15s ease,
+            background .15s ease;
+        }
+
+        .reverse-button:hover {
+          transform: translateY(-1px);
+          border-color: rgba(255, 106, 91, 0.7);
+          background: rgba(68, 12, 20, 0.9);
+        }
+
+        .reverse-button:active {
+          transform: translateY(0) scale(0.97);
+        }
+
+        .reverse-button:focus-visible {
+          outline: 2px solid rgba(255, 120, 100, 0.6);
+          outline-offset: 1px;
+        }
+
+        .reverse-icon {
+          font-size: 14px;
+          line-height: 1;
+        }
+
+        /*
+         * On load the progress bar pulses a red ring with a "Click
+         * here" pill on it, until the visitor first uses the bar or
+         * the Wrap / Unwrap buttons.
+         */
+        @keyframes progress-ring {
+          0% {
+            box-shadow:
+              0 0 0 0 rgba(255, 60, 72, 0.85),
+              0 0 0 0 rgba(255, 60, 72, 0.4);
+            border-color: rgba(255, 70, 80, 0.95);
+          }
+          70% {
+            box-shadow:
+              0 0 0 10px rgba(255, 60, 72, 0),
+              0 0 18px 2px rgba(255, 60, 72, 0.28);
+            border-color: rgba(255, 70, 80, 0.55);
+          }
+          100% {
+            box-shadow:
+              0 0 0 0 rgba(255, 60, 72, 0),
+              0 0 0 0 rgba(255, 60, 72, 0);
+            border-color: rgba(255, 70, 80, 0.3);
+          }
+        }
+
+        @keyframes hint-pulse {
+          0%, 100% {
+            transform: translate(-50%, -50%) scale(1);
+          }
+          50% {
+            transform: translate(-50%, -50%) scale(1.08);
+          }
+        }
+
+        .progress-bar.attention {
+          animation: progress-ring 1.4s ease-out infinite;
+        }
+
+        .progress-hit {
+          position: relative;
+        }
+
+        .bar-hint {
+          position: absolute;
+          left: 50%;
+          top: 50%;
+          z-index: 1;
+          padding: 3px 11px;
+          border-radius: 999px;
+          background: #e0283a;
+          color: #ffffff;
+          font-size: 11px;
+          font-weight: 800;
+          letter-spacing: 0.03em;
+          white-space: nowrap;
+          pointer-events: none;
+          box-shadow: 0 0 14px rgba(255, 60, 72, 0.55);
+          transform: translate(-50%, -50%);
+          animation: hint-pulse 1.4s ease-in-out infinite;
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+          .progress-bar.attention,
+          .bar-hint {
+            animation: none;
+          }
+
+          .progress-bar.attention {
+            box-shadow: 0 0 0 3px rgba(255, 60, 72, 0.6);
+          }
         }
 
         .slider-panel {
@@ -4143,11 +4933,140 @@ export default function App() {
             );
         }
 
-        .mode-pill {
+        /*
+         * Brand mark: the favicon sits beside the title as the logo,
+         * and tips a little to the right when pointed at.
+         */
+        .brand-row {
+          display: flex;
+          align-items: center;
+          gap: 14px;
+        }
+
+        .brand-text {
+          min-width: 0;
+        }
+
+        .brand-mark {
+          flex: none;
+          display: block;
+          width: 52px;
+          height: 52px;
+          border-radius: 12px;
+          pointer-events: auto;
+          transition: transform .22s cubic-bezier(.34, 1.56, .64, 1);
+        }
+
+        .brand-mark img {
+          display: block;
+          width: 100%;
+          height: 100%;
+        }
+
+        .brand-mark:hover,
+        .brand-mark:focus-visible {
+          transform: scale(1.1) rotate(8deg);
+        }
+
+        .brand-mark:focus-visible {
+          outline: 2px solid rgba(98, 230, 255, 0.6);
+          outline-offset: 3px;
+        }
+
+        /*
+         * Buy me a coffee: bottom-left corner. The embed is a fixed
+         * 250 × 60 document, so it is scaled as a whole and the frame
+         * clips to the scaled size.
+         */
+        .coffee-dock {
+          --coffee-scale: 0.72;
+          grid-area: coffee;
+          justify-self: start;
+          align-self: end;
+          pointer-events: auto;
+        }
+
+        .coffee-embed-frame {
+          display: block;
+          width: calc(250px * var(--coffee-scale));
+          height: calc(60px * var(--coffee-scale));
+          overflow: hidden;
+          border-radius: 10px;
+          background: #FFDD00;
+          box-shadow: 0 8px 22px rgba(0, 0, 0, 0.38);
+          transition: transform .15s ease;
+        }
+
+        .coffee-embed-frame:hover {
+          transform: translateY(-1px);
+        }
+
+        .coffee-embed {
+          display: block;
+          width: 250px;
+          height: 60px;
+          border: 0;
+          transform: scale(var(--coffee-scale));
+          transform-origin: 0 0;
+        }
+
+        /*
+         * Desktop bottom row: mode caption left, view switcher dead
+         * centre (equal side columns), coffee button in the corner.
+         */
+        .bottom-row {
+          grid-area: bottom;
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+          align-items: center;
+          gap: 12px;
+        }
+
+        /* grid-area: auto, or its narrow-screen area name would add
+           an implicit row to this grid. */
+        .bottom-row .coffee-dock {
+          grid-area: auto;
+          align-self: center;
+          justify-self: end;
+        }
+
+        .mode-pill.in-row {
+          justify-self: start;
+          min-width: 0;
+        }
+
+        /* Unwrap · Wrap · progress bar, on both screens. */
+        .progress-row {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+        }
+
+        .progress-row .progress-hit {
+          flex: 1 1 auto;
+          min-width: 0;
+        }
+
+        .progress-row .control {
+          flex: none;
+          pointer-events: auto;
+        }
+
+        /* Narrow screens only (see the 820px breakpoint). */
+        .mode-pill.floating {
+          display: none;
           position: absolute;
           left: 22px;
           bottom: 20px;
+          max-width: calc(100% - 44px);
           z-index: 4;
+        }
+
+        .progress-wrap .progress-switch {
+          display: none;
+        }
+
+        .mode-pill {
           pointer-events: none;
           padding: 10px 12px;
           border-radius: 12px;
@@ -4170,10 +5089,11 @@ export default function App() {
           color: #b7cfdb;
         }
 
+        /* Bottom-left, above the progress bar, level with the pad. */
         .field-legend {
           position: absolute;
-          right: 20px;
-          bottom: 20px;
+          left: 22px;
+          bottom: 144px;
           z-index: 4;
           min-width: 245px;
           padding: 12px 13px;
@@ -4255,7 +5175,7 @@ export default function App() {
           position: absolute;
           left: 22px;
           right: 22px;
-          bottom: 92px;
+          bottom: 74px;
           z-index: 4;
           pointer-events: none;
         }
@@ -4268,6 +5188,16 @@ export default function App() {
           margin-bottom: 7px;
           font-size: 11px;
           color: #7f9dad;
+        }
+
+        /*
+         * The view switcher, centred under the progress bar. Shared by
+         * both screens, so it sits in the same relative spot on each.
+         */
+        .progress-switch {
+          display: flex;
+          justify-content: center;
+          margin-top: 4px;
         }
 
         .progress-hit {
@@ -4364,7 +5294,7 @@ export default function App() {
         .direction-controls {
           position: absolute;
           right: 22px;
-          bottom: 150px;
+          bottom: 144px;
           z-index: 5;
           display: flex;
           align-items: flex-end;
@@ -4594,12 +5524,15 @@ export default function App() {
             top: 16px;
             left: 18px;
             right: 18px;
+            bottom: 16px;
             grid-template-columns: minmax(0, 1fr);
             grid-template-areas:
               "title"
               "controls"
-              "help";
-            grid-template-rows: auto;
+              "help"
+              "."
+              "bottom";
+            grid-template-rows: auto auto auto 1fr auto;
             row-gap: 10px;
           }
 
@@ -4621,6 +5554,50 @@ export default function App() {
           .help {
             max-width: 560px;
           }
+
+          /*
+           * Stacked layout: the bottom row keeps only the coffee button,
+           * still in the bottom-right corner. Its switcher and caption
+           * give way to the narrow-screen copies (switcher under the
+           * progress bar, caption bottom-left beside the coffee).
+           */
+          .bottom-switch,
+          .mode-pill.in-row {
+            display: none;
+          }
+
+          .bottom-row .coffee-dock {
+            --coffee-scale: 0.6;
+            grid-column: 3;
+          }
+
+          .mode-pill.floating {
+            display: block;
+            max-width: calc(100% - 44px - 162px);
+          }
+
+          .progress-wrap {
+            bottom: 92px;
+          }
+
+          .progress-wrap .progress-switch {
+            display: flex;
+          }
+
+          .direction-controls {
+            bottom: 202px;
+          }
+
+          /* The coffee button owns the bottom-right corner, so the
+             legend sits above the progress bar on the left. */
+          .field-legend {
+            bottom: 200px;
+          }
+
+          .brand-mark {
+            width: 44px;
+            height: 44px;
+          }
         }
 
         @media (max-width: 620px) {
@@ -4630,8 +5607,19 @@ export default function App() {
 
           .direction-controls {
             right: 16px;
-            bottom: 142px;
+            bottom: 194px;
             gap: 10px;
+          }
+
+          /*
+           * Phones: beside the coffee button the caption would wrap
+           * into the switcher, so it moves above the progress bar,
+           * left of the pan pad, and grows upwards.
+           */
+          .mode-pill.floating {
+            bottom: 194px;
+            max-width: calc(100% - 44px - 140px);
+            font-size: 11px;
           }
 
           .direction-pad {
@@ -4708,40 +5696,36 @@ export default function App() {
 
         <div className="hud top-bar">
           <div className="top-title">
-            <div className="kicker">
-              Magnetism · 3D exploration
-            </div>
+            <div className="brand-row">
+              <a
+                className="brand-mark"
+                href={SITE_URL}
+                title="awm physics"
+                aria-label="awm physics home page"
+              >
+                <img
+                  src={FAVICON_SRC}
+                  alt=""
+                  width="52"
+                  height="52"
+                />
+              </a>
 
-            <h1 className="title">
-              From straight wire to
-              solenoid
-            </h1>
+              <div className="brand-text">
+                <div className="kicker">
+                  Magnetism · 3D exploration
+                </div>
+
+                <h1 className="title">
+                  From straight wire to
+                  solenoid
+                </h1>
+              </div>
+            </div>
           </div>
 
           <div className="top-controls">
             <div className="toolbar">
-              <div
-                className="toolbar-group"
-                role="group"
-                aria-label="Build the coil"
-              >
-                <button
-                  className="control"
-                  onClick={triggerUndo}
-                  disabled={!canUndo}
-                >
-                  Unwrap
-                </button>
-
-                <button
-                  className="control primary"
-                  onClick={triggerWrap}
-                  disabled={!canWrap}
-                >
-                  Wrap
-                </button>
-              </div>
-
               <div
                 className="toolbar-group"
                 role="group"
@@ -4755,6 +5739,16 @@ export default function App() {
                   />
                   <span>Show current</span>
                 </label>
+
+                <button
+                  type="button"
+                  className="current-toggle reverse-button"
+                  onClick={handleCurrentReverseToggle}
+                  title="Reverse the direction of current flow, flipping the field and swapping pole labels"
+                >
+                  <span className="reverse-icon" aria-hidden="true">⇄</span>
+                  <span>Reverse current</span>
+                </button>
 
                 <label className="current-toggle">
                   <input
@@ -4839,6 +5833,27 @@ export default function App() {
             compare their fields ·
             Click the progress bar
             to jump to a section count
+          </div>
+
+          {/*
+            Desktop bottom row: view switcher, mode caption, coffee.
+            On narrow screens this row dissolves (display: contents):
+            its switcher and caption hide in favour of the copies placed
+            for small screens, and the coffee button drops in under the
+            help text.
+          */}
+          <div className="bottom-row">
+            <div className="mode-pill in-row">
+              {modeCaption}
+            </div>
+
+            <div className="bottom-switch">
+              {switcher}
+            </div>
+
+            <div className="coffee-dock">
+              <BuyMeCoffeeButton />
+            </div>
           </div>
         </div>
 
@@ -5060,58 +6075,80 @@ export default function App() {
             </span>
           </div>
 
+          {/* Unwrap · Wrap · progress */}
           <div
-            className="progress-hit"
-            role="slider"
-            aria-label="Sections wrapped"
-            aria-valuemin={0}
-            aria-valuemax={
-              SECTION_COUNT
-            }
-            aria-valuenow={
-              wrappedCount
-            }
-            onClick={
-              handleProgressBarClick
-            }
-            onPointerMove={
-              handleProgressBarDrag
-            }
+            className="progress-row"
+            onPointerDownCapture={() => setBarAttention(false)}
           >
-            <div className="progress-bar">
+            <button
+              className="control"
+              onClick={triggerUndo}
+              disabled={!canUndo}
+            >
+              Unwrap
+            </button>
+
+            <button
+              className="control primary"
+              onClick={triggerWrap}
+              disabled={!canWrap}
+            >
+              Wrap
+            </button>
+
+            <div
+              className="progress-hit"
+              role="slider"
+              aria-label="Sections wrapped"
+              aria-valuemin={0}
+              aria-valuemax={
+                SECTION_COUNT
+              }
+              aria-valuenow={
+                wrappedCount
+              }
+              onClick={
+                handleProgressBarClick
+              }
+              onPointerMove={
+                handleProgressBarDrag
+              }
+            >
+              {barAttention && (
+                <span className="bar-hint" aria-hidden="true">
+                  Click here
+                </span>
+              )}
+
               <div
-                className="progress-fill"
-                style={{
-                  width: `${
-                    (wrappedCount /
-                      SECTION_COUNT) *
-                    100
-                  }%`,
-                }}
-              />
+                className={`progress-bar${
+                  barAttention ? ' attention' : ''
+                }`}
+              >
+                <div
+                  className="progress-fill"
+                  style={{
+                    width: `${
+                      (wrappedCount /
+                        SECTION_COUNT) *
+                      100
+                    }%`,
+                  }}
+                />
+              </div>
             </div>
+          </div>
+
+          <div className="progress-switch">
+            {switcher}
           </div>
         </div>
 
-        <div className="mode-pill">
-          {mode === 'combined' &&
-            'Blue field lines show the superposed field from every wrapped section.'}
-
-          {mode === 'all' &&
-            'Every section has its own independently rendered, color-coded field.'}
-
-          {mode === 'individual' &&
-            (selectedSections.length > 1
-              ? `${selectedSections.length} sections are isolated — pink field lines show their combined contribution.`
-              : `Section ${
-                  (selectedSections[0] ??
-                    0) + 1
-                } is isolated — pink field lines show only its contribution.`)}
-
-          {mode === 'none' &&
-            'The magnetic field visualization is hidden.'}
+        {/* Narrow screens: the caption floats in the bottom-left corner. */}
+        <div className="mode-pill floating">
+          {modeCaption}
         </div>
-        
+
         <FieldLegend
           selectedSections={
             selectedSections
@@ -5123,5 +6160,2559 @@ export default function App() {
         />
       </div>
     </div>
+  );
+}
+/* =====================================================================
+ * Cross-section screen
+ *
+ * A slice through the solenoid along its axis. Every turn pierces the
+ * page twice: at the top (current out of the page, ⊙) and at the bottom
+ * (current into the page, ⊗). In the plane of the slice each piercing
+ * acts like a long straight wire, so the in-plane field is the 2D
+ * superposition of those line currents (units with μ0/2π = 1):
+ *
+ *   B(r) = Σ q_k · ẑ × (r − r_k) / |r − r_k|²
+ *
+ * The field lines are then exactly the level curves of the vector
+ * potential A(r) = −Σ q_k ln|r − r_k|. Contours of A drawn at equal
+ * spacing give lines whose density *is* the field strength, which is
+ * what lets "adjacent turns cancel, opposite sides add" show up
+ * honestly: lines thin out where fields cancel and crowd where they add.
+ * ===================================================================== */
+
+const SLICE_R = 1;
+const SLICE_PITCH = 0.62;
+const SLICE_MAX_TURNS = 10;
+const SLICE_START_TURNS = 3;
+const SLICE_WIRE_R = 0.12;
+const SLICE_TURN_LENGTH = Math.PI * 2 * SLICE_R;
+
+// World height kept in view; the width follows the coil (see draw).
+const SLICE_WORLD_H = 4.5;
+// Room kept either side of the coil for its fringe field, world units.
+const SLICE_WORLD_MARGIN = 4.6;
+
+const SLICE_WRAP_MS = 1900;
+// Per-turn time when jumping several turns from the progress bar.
+const SLICE_JUMP_MS = 650;
+// How far the far end of a wrapping turn lags its near end (0..1).
+const SLICE_WRAP_STAGGER = 0.25;
+// Oblique projection: screen x shift per unit of depth. Negative makes
+// the front half of each turn bow to the left, as in a textbook sketch.
+const SLICE_OBLIQUE = -0.24;
+
+const SLICE_A_COLOR = '#ffb547';
+const SLICE_B_COLOR = '#ff5fa8';
+const SLICE_CURRENT_COLOR = '#ff4a5a';
+const SLICE_BG = '#05080d';
+
+const sliceClamp = (v, lo, hi) =>
+  Math.min(hi, Math.max(lo, v));
+
+const sliceSmooth = (t) => t * t * (3 - 2 * t);
+
+function sliceEase(t) {
+  return t < 0.5
+    ? 4 * t * t * t
+    : 1 - Math.pow(-2 * t + 2, 3) / 2;
+}
+
+function sliceTurnX(i) {
+  return i * SLICE_PITCH;
+}
+
+/*
+ * A point on the turn that is part-way through wrapping.
+ *
+ * s runs along the wire from the turn's top crossing. Unwrapped, the
+ * wire lies straight along the top of the slice; wrapped, it is a loop
+ * round the axis. Each point rolls round the axis by its own angle
+ * while sliding home in x, so the wire wraps onto the coil's surface
+ * rather than cutting through the bore. The near end leads the far end
+ * by SLICE_WRAP_STAGGER. The fourth value is the roll angle, used to
+ * find where the wire passes through the page.
+ */
+function sliceFormingPoint(i, s, E) {
+  const u = sliceSmooth(
+    sliceClamp(
+      (E - SLICE_WRAP_STAGGER * (s / SLICE_TURN_LENGTH)) /
+        (1 - SLICE_WRAP_STAGGER),
+      0,
+      1,
+    ),
+  );
+
+  const phi = s / SLICE_R;
+  const theta = u * phi;
+  const x0 = sliceTurnX(i);
+
+  const xLoop =
+    phi <= Math.PI
+      ? x0
+      : x0 + (SLICE_PITCH * (phi - Math.PI)) / Math.PI;
+
+  const xStraight = x0 + s;
+
+  return [
+    xStraight + (xLoop - xStraight) * u,
+    SLICE_R * Math.cos(theta),
+    SLICE_R * Math.sin(theta),
+    theta,
+  ];
+}
+
+function sliceCrossingFromId(id, dir) {
+  if (!id) return null;
+
+  const top = id[0] === 't';
+  const turn = Number(id.slice(1));
+
+  return {
+    id,
+    turn,
+    side: top ? 'top' : 'bottom',
+    x: sliceTurnX(turn),
+    y: top ? SLICE_R : -SLICE_R,
+    I: top ? dir : -dir,
+    w: 1,
+  };
+}
+
+/*
+ * Every place the wire pierces the page, with its current sign I
+ * (+1 out of the page, −1 into it) and a weight w used to fade
+ * crossings in while a turn forms.
+ *
+ * Current runs down the front of each turn (for dir = +1), so it comes
+ * out of the page at the top and goes into it at the bottom.
+ */
+function sliceCrossings(geo, dir) {
+  const out = [];
+
+  for (let i = 0; i < geo.base; i++) {
+    out.push(sliceCrossingFromId(`t${i}`, dir));
+    out.push(sliceCrossingFromId(`b${i}`, dir));
+  }
+
+  if (geo.E == null) return out;
+
+  const i = geo.base;
+  const x0 = sliceTurnX(i);
+
+  // Top: the wire leaves the page here as soon as it starts to curl.
+  out.push({
+    id: null,
+    turn: i,
+    side: 'top',
+    x: x0,
+    y: SLICE_R,
+    I: dir,
+    w: sliceSmooth(sliceClamp(geo.E / 0.18, 0, 1)),
+    forming: true,
+  });
+
+  /*
+   * Bottom: wherever the curling wire's roll angle passes through π.
+   * Rolling forward through π the wire goes from the front to the back
+   * of the page (into it); rolling back through π it comes out. A
+   * crossing born at the free end fades in as it slides away from it.
+   */
+  const samples = 240;
+  let prev = sliceFormingPoint(i, 0, geo.E);
+
+  for (let k = 1; k <= samples; k++) {
+    const s = (k / samples) * SLICE_TURN_LENGTH;
+    const cur = sliceFormingPoint(i, s, geo.E);
+    const a = prev[3] - Math.PI;
+    const b = cur[3] - Math.PI;
+
+    if ((a < 0) !== (b < 0)) {
+      const t = a / (a - b);
+      const forward = b > a ? 1 : -1;
+      const fromEnd = 1 - (k - 1 + t) / samples;
+
+      out.push({
+        id: null,
+        turn: i,
+        side: 'bottom',
+        x: prev[0] + (cur[0] - prev[0]) * t,
+        y: -SLICE_R,
+        I: -dir * forward,
+        w: sliceSmooth(sliceClamp(fromEnd / 0.1, 0, 1)),
+        forming: true,
+      });
+    }
+
+    prev = cur;
+  }
+
+  return out;
+}
+
+function sliceFieldAt(wires, x, y) {
+  let bx = 0;
+  let by = 0;
+
+  for (const w of wires) {
+    const q = w.I * w.w;
+    if (!q) continue;
+
+    const dx = x - w.x;
+    const dy = y - w.y;
+    const d2 = Math.max(dx * dx + dy * dy, 1e-6);
+
+    bx -= (q * dy) / d2;
+    by += (q * dx) / d2;
+  }
+
+  return [bx, by];
+}
+
+function sliceView(width, height, cx, cy, scale) {
+  return {
+    width,
+    height,
+    cx,
+    cy,
+    scale,
+    sx(x) {
+      return (x - cx) * scale + width / 2;
+    },
+    sy(y) {
+      return height / 2 - (y - cy) * scale;
+    },
+    wx(px) {
+      return cx + (px - width / 2) / scale;
+    },
+    wy(py) {
+      return cy - (py - height / 2) / scale;
+    },
+    // 3D point -> screen, with depth shown as an oblique x shift.
+    project(p) {
+      return [
+        this.sx(p[0] + SLICE_OBLIQUE * p[2]),
+        this.sy(p[1]),
+      ];
+    },
+  };
+}
+
+/*
+ * Potential A and field strength |B| sampled on a screen-space grid.
+ * Nodes inside a wire's marker are flagged so contours and colour skip
+ * the singularity there.
+ */
+function sliceGrid(wires, view, step, cutoff) {
+  const nx = Math.ceil(view.width / step) + 2;
+  const ny = Math.ceil(view.height / step) + 2;
+  const count = nx * ny;
+
+  const A = new Float32Array(count);
+  const B = new Float32Array(count);
+  const near = new Uint8Array(count);
+
+  const active = wires.filter(
+    (w) => Math.abs(w.I * w.w) > 1e-4,
+  );
+  const n = active.length;
+  const wx = new Float64Array(n);
+  const wy = new Float64Array(n);
+  const q = new Float64Array(n);
+  const cut2 = new Float64Array(n);
+
+  for (let k = 0; k < n; k++) {
+    wx[k] = active[k].x;
+    wy[k] = active[k].y;
+    q[k] = active[k].I * active[k].w;
+    cut2[k] = Math.abs(q[k]) > 0.2 ? cutoff * cutoff : 0;
+  }
+
+  const inv = 1 / view.scale;
+  let idx = 0;
+
+  for (let j = 0; j < ny; j++) {
+    const y = view.cy + (view.height / 2 - j * step) * inv;
+
+    for (let i = 0; i < nx; i++, idx++) {
+      const x = view.cx + (i * step - view.width / 2) * inv;
+
+      let a = 0;
+      let bx = 0;
+      let by = 0;
+      let nr = 0;
+
+      for (let k = 0; k < n; k++) {
+        const dx = x - wx[k];
+        const dy = y - wy[k];
+        let d2 = dx * dx + dy * dy;
+
+        if (d2 < cut2[k]) nr = 1;
+        if (d2 < 1e-8) d2 = 1e-8;
+
+        const qk = q[k];
+        a -= qk * Math.log(d2);
+
+        const f = qk / d2;
+        bx -= f * dy;
+        by += f * dx;
+      }
+
+      // −q ln d² is twice −q ln d.
+      A[idx] = a * 0.5;
+      B[idx] = Math.sqrt(bx * bx + by * by);
+      near[idx] = nr;
+    }
+  }
+
+  return { nx, ny, step, A, B, near };
+}
+
+/*
+ * Marching squares over the potential: one contour per multiple of
+ * `spacing`. Also proposes arrow sites, roughly one per field line per
+ * arrowCell of screen.
+ */
+function sliceContours(grid, spacing, arrowCell) {
+  const { nx, ny, step, A, near } = grid;
+
+  let segs = new Float32Array(32768);
+  let n = 0;
+
+  const arrowKeys = new Set();
+  const arrows = [];
+
+  function push(x1, y1, x2, y2, k) {
+    if (n + 4 > segs.length) {
+      const bigger = new Float32Array(segs.length * 2);
+      bigger.set(segs);
+      segs = bigger;
+    }
+
+    segs[n++] = x1 * step;
+    segs[n++] = y1 * step;
+    segs[n++] = x2 * step;
+    segs[n++] = y2 * step;
+
+    const mx = ((x1 + x2) / 2) * step;
+    const my = ((y1 + y2) / 2) * step;
+    const key =
+      ((k + 50000) * 4096 + Math.floor(my / arrowCell)) * 4096 +
+      Math.floor(mx / arrowCell);
+
+    if (!arrowKeys.has(key)) {
+      arrowKeys.add(key);
+      arrows.push([mx, my]);
+    }
+  }
+
+  for (let j = 0; j < ny - 1; j++) {
+    for (let i = 0; i < nx - 1; i++) {
+      const i0 = j * nx + i;
+      const i1 = i0 + 1;
+      const i3 = i0 + nx;
+      const i2 = i3 + 1;
+
+      if (near[i0] | near[i1] | near[i2] | near[i3]) continue;
+
+      const v0 = A[i0];
+      const v1 = A[i1];
+      const v2 = A[i2];
+      const v3 = A[i3];
+
+      const lo = Math.min(v0, v1, v2, v3);
+      const hi = Math.max(v0, v1, v2, v3);
+      const k0 = Math.ceil(lo / spacing);
+      const k1 = Math.floor(hi / spacing);
+
+      // Many levels in one cell means a singularity: skip it.
+      if (k1 < k0 || k1 - k0 > 3) continue;
+
+      for (let k = k0; k <= k1; k++) {
+        const L = k * spacing;
+        const a0 = v0 > L;
+        const a1 = v1 > L;
+        const a2 = v2 > L;
+        const a3 = v3 > L;
+
+        // Edge crossings in order: top, right, bottom, left.
+        const px = [];
+        const py = [];
+        const at = [];
+
+        if (a0 !== a1) {
+          px.push(i + (L - v0) / (v1 - v0));
+          py.push(j);
+          at.push(0);
+        }
+        if (a1 !== a2) {
+          px.push(i + 1);
+          py.push(j + (L - v1) / (v2 - v1));
+          at.push(1);
+        }
+        if (a3 !== a2) {
+          px.push(i + (L - v3) / (v2 - v3));
+          py.push(j + 1);
+          at.push(2);
+        }
+        if (a0 !== a3) {
+          px.push(i);
+          py.push(j + (L - v0) / (v3 - v0));
+          at.push(3);
+        }
+
+        if (px.length === 2) {
+          push(px[0], py[0], px[1], py[1], k);
+        } else if (px.length === 4) {
+          // Saddle: decide which corners the centre joins.
+          const c = (v0 + v1 + v2 + v3) / 4;
+
+          if (c > L === a0) {
+            push(px[0], py[0], px[1], py[1], k);
+            push(px[2], py[2], px[3], py[3], k);
+          } else {
+            push(px[0], py[0], px[3], py[3], k);
+            push(px[1], py[1], px[2], py[2], k);
+          }
+        }
+      }
+    }
+  }
+
+  return { segs, count: n / 4, arrows };
+}
+
+// Keep arrow sites at least minDist apart.
+function sliceThin(points, minDist) {
+  const cell = minDist;
+  const buckets = new Map();
+  const kept = [];
+  const min2 = minDist * minDist;
+
+  for (const p of points) {
+    const cx = Math.floor(p[0] / cell);
+    const cy = Math.floor(p[1] / cell);
+    let ok = true;
+
+    for (let dy = -1; dy <= 1 && ok; dy++) {
+      for (let dx = -1; dx <= 1 && ok; dx++) {
+        const list = buckets.get(`${cx + dx},${cy + dy}`);
+        if (!list) continue;
+
+        for (const o of list) {
+          const ex = o[0] - p[0];
+          const ey = o[1] - p[1];
+          if (ex * ex + ey * ey < min2) {
+            ok = false;
+            break;
+          }
+        }
+      }
+    }
+
+    if (!ok) continue;
+
+    kept.push(p);
+    const key = `${cx},${cy}`;
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key).push(p);
+  }
+
+  return kept;
+}
+
+// Field strength colour ramp: transparent → deep blue → cyan → white.
+const SLICE_STRENGTH_STOPS = [
+  [0.0, 5, 8, 13, 0],
+  [0.22, 10, 34, 78, 0.5],
+  [0.5, 16, 96, 164, 0.66],
+  [0.78, 70, 186, 232, 0.78],
+  [1.0, 218, 247, 255, 0.9],
+];
+
+function sliceStrengthCanvas(grid, b0, bmax, alpha, cache) {
+  const { nx, ny, B, near } = grid;
+
+  let canvas = cache.canvas;
+  if (!canvas || canvas.width !== nx || canvas.height !== ny) {
+    canvas = document.createElement('canvas');
+    canvas.width = nx;
+    canvas.height = ny;
+    cache.canvas = canvas;
+  }
+
+  const ctx = canvas.getContext('2d');
+  const img = ctx.createImageData(nx, ny);
+  const data = img.data;
+  const norm = Math.log1p(bmax / b0);
+  const stops = SLICE_STRENGTH_STOPS;
+
+  for (let idx = 0, o = 0; idx < nx * ny; idx++, o += 4) {
+    const t = near[idx]
+      ? 1
+      : Math.min(1, Math.log1p(B[idx] / b0) / norm);
+
+    let s = 1;
+    while (s < stops.length - 1 && stops[s][0] < t) s++;
+
+    const lo = stops[s - 1];
+    const hi = stops[s];
+    const f = (t - lo[0]) / (hi[0] - lo[0] || 1);
+
+    data[o] = lo[1] + (hi[1] - lo[1]) * f;
+    data[o + 1] = lo[2] + (hi[2] - lo[2]) * f;
+    data[o + 2] = lo[3] + (hi[3] - lo[3]) * f;
+    data[o + 3] = 255 * alpha * (lo[4] + (hi[4] - lo[4]) * f);
+  }
+
+  ctx.putImageData(img, 0, 0);
+  return canvas;
+}
+
+// Filled isosceles arrowhead centred on (x, y), pointing along (ux, uy).
+function sliceArrowhead(ctx, x, y, ux, uy, size) {
+  const half = size * 0.46;
+  const back = size * 0.5;
+  const fwd = size * 0.6;
+  const px = -uy;
+  const py = ux;
+
+  ctx.beginPath();
+  ctx.moveTo(x + ux * fwd, y + uy * fwd);
+  ctx.lineTo(x - ux * back + px * half, y - uy * back + py * half);
+  ctx.lineTo(x - ux * back - px * half, y - uy * back - py * half);
+  ctx.closePath();
+  ctx.fill();
+}
+
+// A vector drawn as a shaft plus a filled isosceles head.
+function sliceVector(ctx, x, y, vx, vy, color, width = 3) {
+  const len = Math.hypot(vx, vy);
+  if (len < 1.5) return;
+
+  const ux = vx / len;
+  const uy = vy / len;
+  const head = Math.min(13, Math.max(7, len * 0.42));
+  const shaft = Math.max(0, len - head * 0.8);
+
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.fillStyle = color;
+  ctx.lineWidth = width;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(x, y);
+  ctx.lineTo(x + ux * shaft, y + uy * shaft);
+  ctx.stroke();
+
+  const tx = x + ux * len;
+  const ty = y + uy * len;
+  const half = head * 0.5;
+  ctx.beginPath();
+  ctx.moveTo(tx, ty);
+  ctx.lineTo(tx - ux * head - uy * half, ty - uy * head + ux * half);
+  ctx.lineTo(tx - ux * head + uy * half, ty - uy * head - ux * half);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+/*
+ * Field layer: optional strength map underneath, contour field lines
+ * and direction arrows on top. Returns the sampled grid.
+ */
+function drawSliceField(ctx, view, wires, opts) {
+  const grid = sliceGrid(wires, view, opts.step, opts.cutoff);
+
+  if (opts.strength) {
+    const img = sliceStrengthCanvas(
+      grid,
+      opts.b0,
+      opts.bmax,
+      opts.strengthAlpha,
+      opts.cache,
+    );
+
+    // Bilinear is plenty for a smooth colour field, and far cheaper
+    // to rasterise than 'high' on every animation frame.
+    ctx.save();
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'low';
+    ctx.drawImage(
+      img,
+      -opts.step / 2,
+      -opts.step / 2,
+      grid.nx * opts.step,
+      grid.ny * opts.step,
+    );
+    ctx.restore();
+  }
+
+  if (opts.lines) {
+    const { segs, count, arrows } = sliceContours(
+      grid,
+      opts.spacing,
+      opts.arrowCell,
+    );
+
+    // Contour pieces join end to end, so butt caps leave no gaps and
+    // rasterise at half the cost of round ones.
+    ctx.save();
+    ctx.lineCap = 'butt';
+    ctx.strokeStyle = opts.lineColor;
+    ctx.lineWidth = opts.lineWidth;
+    ctx.beginPath();
+
+    for (let k = 0; k < count * 4; k += 4) {
+      ctx.moveTo(segs[k], segs[k + 1]);
+      ctx.lineTo(segs[k + 2], segs[k + 3]);
+    }
+
+    ctx.stroke();
+
+    ctx.fillStyle = opts.arrowColor;
+
+    for (const [px, py] of sliceThin(arrows, opts.arrowMinDist)) {
+      const [bx, by] = sliceFieldAt(
+        wires,
+        view.wx(px),
+        view.wy(py),
+      );
+      const m = Math.hypot(bx, by);
+      if (m < 1e-3) continue;
+
+      // Screen y points down, so the field's y flips.
+      sliceArrowhead(ctx, px, py, bx / m, -by / m, opts.arrowSize);
+    }
+
+    ctx.restore();
+  }
+
+  return grid;
+}
+
+/*
+ * The wire as 3D polylines, split into runs behind the page, in it,
+ * and in front of it, so each can be drawn in the right layer.
+ */
+function sliceCoilRuns(geo, view) {
+  const pts = [];
+  const xLeft = view.wx(-60);
+  const xRight = view.wx(view.width + 60);
+
+  // Lead in from the left, lying in the page along the top.
+  pts.push([Math.min(xLeft, -1), SLICE_R, 0]);
+
+  for (let i = 0; i < geo.base; i++) {
+    const x0 = sliceTurnX(i);
+
+    for (let k = 0; k <= 56; k++) {
+      const phi = (k / 56) * Math.PI * 2;
+      pts.push([
+        phi <= Math.PI
+          ? x0
+          : x0 + (SLICE_PITCH * (phi - Math.PI)) / Math.PI,
+        SLICE_R * Math.cos(phi),
+        SLICE_R * Math.sin(phi),
+      ]);
+    }
+  }
+
+  if (geo.E != null) {
+    for (let k = 0; k <= 180; k++) {
+      const p = sliceFormingPoint(
+        geo.base,
+        (k / 180) * SLICE_TURN_LENGTH,
+        geo.E,
+      );
+      pts.push([p[0], p[1], p[2]]);
+    }
+
+    // The unwound tail trails off parallel to the axis.
+    const end = pts[pts.length - 1];
+    pts.push([Math.max(xRight, end[0] + 1), end[1], end[2]]);
+  } else {
+    const x = sliceTurnX(geo.base);
+    pts.push([x, SLICE_R, 0]);
+    pts.push([Math.max(xRight, x + 1), SLICE_R, 0]);
+  }
+
+  const runs = { back: [], plane: [], front: [] };
+  let run = null;
+  let kind = null;
+
+  for (let k = 1; k < pts.length; k++) {
+    const a = pts[k - 1];
+    const b = pts[k];
+    const zm = (a[2] + b[2]) / 2;
+    const kk = zm > 0.01 ? 'front' : zm < -0.01 ? 'back' : 'plane';
+
+    if (kk !== kind) {
+      run = [view.project(a)];
+      runs[kk].push(run);
+      kind = kk;
+    }
+
+    run.push(view.project(b));
+  }
+
+  return runs;
+}
+
+function strokeRuns(ctx, runs) {
+  for (const run of runs) {
+    if (run.length < 2) continue;
+    ctx.beginPath();
+    ctx.moveTo(run[0][0], run[0][1]);
+    for (let k = 1; k < run.length; k++) {
+      ctx.lineTo(run[k][0], run[k][1]);
+    }
+    ctx.stroke();
+  }
+}
+
+// A turn's front half reads as a solid metal bar passing in front.
+function drawFrontRuns(ctx, runs, width) {
+  ctx.save();
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+
+  ctx.strokeStyle = 'rgba(8, 12, 18, 0.9)';
+  ctx.lineWidth = width + 3;
+  strokeRuns(ctx, runs);
+
+  ctx.strokeStyle = 'rgba(132, 146, 160, 0.9)';
+  ctx.lineWidth = width;
+  strokeRuns(ctx, runs);
+
+  ctx.translate(-width * 0.16, -width * 0.12);
+  ctx.strokeStyle = 'rgba(226, 236, 244, 0.42)';
+  ctx.lineWidth = width * 0.26;
+  strokeRuns(ctx, runs);
+  ctx.restore();
+}
+
+function drawCrossingMarker(ctx, x, y, r, I, alpha) {
+  if (alpha <= 0.01) return;
+
+  ctx.save();
+  ctx.globalAlpha = alpha;
+
+  const g = ctx.createRadialGradient(
+    x - r * 0.35,
+    y - r * 0.35,
+    r * 0.1,
+    x,
+    y,
+    r,
+  );
+  g.addColorStop(0, '#f4f7fa');
+  g.addColorStop(1, '#a9b5c1');
+
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  ctx.fillStyle = g;
+  ctx.fill();
+  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = 'rgba(10, 14, 20, 0.95)';
+  ctx.stroke();
+
+  ctx.fillStyle = SLICE_CURRENT_COLOR;
+  ctx.strokeStyle = SLICE_CURRENT_COLOR;
+
+  if (I > 0) {
+    // ⊙ current out of the page
+    ctx.beginPath();
+    ctx.arc(x, y, r * 0.3, 0, Math.PI * 2);
+    ctx.fill();
+  } else {
+    // ⊗ current into the page
+    const c = r * 0.48;
+    ctx.lineWidth = Math.max(1.6, r * 0.2);
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(x - c, y - c);
+    ctx.lineTo(x + c, y + c);
+    ctx.moveTo(x + c, y - c);
+    ctx.lineTo(x - c, y + c);
+    ctx.stroke();
+  }
+
+  ctx.restore();
+}
+
+function drawSelectionRing(ctx, x, y, r, color, label, below) {
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2.5;
+  ctx.shadowColor = color;
+  ctx.shadowBlur = 10;
+  ctx.beginPath();
+  ctx.arc(x, y, r + 5, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+
+  if (label) {
+    const ly = below ? y + r + 17 : y - r - 17;
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(x, ly, 9, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#10141c';
+    ctx.font = '800 11px Inter, system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(label, x, ly + 0.5);
+  }
+
+  ctx.restore();
+}
+
+function drawPoleLabel(ctx, x, y, letter) {
+  const color = letter === 'N' ? '#ff2231' : '#1f6bff';
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(x, y, 14, 0, Math.PI * 2);
+  ctx.fillStyle = '#0b1018';
+  ctx.fill();
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = color;
+  ctx.stroke();
+  ctx.fillStyle = color;
+  ctx.font = '800 14px Inter, system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(letter, x, y + 0.5);
+  ctx.restore();
+}
+
+function drawProbe(ctx, x, y, vectors, scale) {
+  if (vectors) {
+    const [a, b] = vectors;
+    const sum = [a[0] + b[0], a[1] + b[1]];
+
+    sliceVector(ctx, x, y, a[0] * scale, -a[1] * scale, SLICE_A_COLOR, 2.5);
+    sliceVector(ctx, x, y, b[0] * scale, -b[1] * scale, SLICE_B_COLOR, 2.5);
+    sliceVector(ctx, x, y, sum[0] * scale, -sum[1] * scale, '#ffffff', 3);
+  }
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(x, y, 8, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(5, 8, 13, 0.55)';
+  ctx.fill();
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = '#ffffff';
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(x, y, 2.2, 0, Math.PI * 2);
+  ctx.fillStyle = '#ffffff';
+  ctx.fill();
+  ctx.restore();
+}
+
+// Readout of the two selected crossings' fields at the probe.
+function sliceReadout(a, b, probe, coilWires) {
+  if (!a || !b || !probe) return null;
+
+  const fa = sliceFieldAt([a], probe[0], probe[1]);
+  const fb = sliceFieldAt([b], probe[0], probe[1]);
+  const sum = [fa[0] + fb[0], fa[1] + fb[1]];
+  const coil = sliceFieldAt(coilWires, probe[0], probe[1]);
+
+  const ma = Math.hypot(...fa);
+  const mb = Math.hypot(...fb);
+  const ms = Math.hypot(...sum);
+  const mc = Math.hypot(...coil);
+
+  const agreement = ma + mb > 1e-9 ? ms / (ma + mb) : 0;
+  const cos =
+    ma > 1e-9 && mb > 1e-9
+      ? (fa[0] * fb[0] + fa[1] * fb[1]) / (ma * mb)
+      : 1;
+  const angle = (Math.acos(sliceClamp(cos, -1, 1)) * 180) / Math.PI;
+
+  return { fa, fb, sum, ma, mb, ms, mc, agreement, angle };
+}
+
+function sliceRelation(a, b) {
+  const gap = Math.abs(a.turn - b.turn);
+  const sameSide = a.side === b.side;
+
+  const where = sameSide
+    ? gap === 1
+      ? 'Neighbouring turns, same side'
+      : `Same side, ${gap} turns apart`
+    : gap === 0
+      ? 'Opposite sides of one turn'
+      : `Opposite sides, ${gap} turn${gap === 1 ? '' : 's'} apart`;
+
+  const current = sameSide
+    ? 'current flows the same way through both'
+    : 'current flows opposite ways';
+
+  return { where, current, sameSide };
+}
+
+function SliceView({ switcher, active }) {
+  const stageRef = useRef(null);
+  const canvasRef = useRef(null);
+  const compareRef = useRef(null);
+  const miniRefs = useRef([]);
+
+  const [turns, setTurns] = useState(SLICE_START_TURNS);
+  const [animating, setAnimating] = useState(false);
+  const [reversed, setReversed] = useState(false);
+  const [showTurns, setShowTurns] = useState(true);
+  const [source, setSource] = useState('coil');
+  const [display, setDisplay] = useState('both');
+  const [density, setDensity] = useState(12);
+  const [selection, setSelection] = useState({ a: null, b: null });
+  const [probe, setProbe] = useState(null);
+  const [miniTick, setMiniTick] = useState(0);
+  // Pulse the progress bar when this screen first opens, until used.
+  const [barAttention, setBarAttention] = useState(true);
+
+  const dir = reversed ? -1 : 1;
+  const spacing = 9 / density;
+
+  const live = useRef({});
+  live.current = {
+    reversed,
+    dir,
+    showTurns,
+    source,
+    display,
+    spacing,
+    selection,
+    probe,
+    active,
+  };
+
+  const progressFillRef = useRef(null);
+
+  const sim = useRef({
+    turns: SLICE_START_TURNS,
+    // Turn count being worked towards; turns wrap one at a time.
+    target: SLICE_START_TURNS,
+    fast: false,
+    anim: null,
+    dirty: true,
+    view: null,
+    hover: null,
+    drag: null,
+    down: null,
+    cache: {},
+  });
+
+  const crossA = sliceCrossingFromId(selection.a, dir);
+  const crossB = sliceCrossingFromId(selection.b, dir);
+  const pairReady = Boolean(crossA && crossB);
+
+  const coilWires = sliceCrossings({ base: turns, E: null }, dir);
+  const readout = sliceReadout(crossA, crossB, probe, coilWires);
+  const relation = pairReady ? sliceRelation(crossA, crossB) : null;
+
+  // Move the probe to the pair's midpoint whenever the pair changes.
+  useEffect(() => {
+    if (selection.a && selection.b) {
+      const a = sliceCrossingFromId(selection.a, 1);
+      const b = sliceCrossingFromId(selection.b, 1);
+      setProbe([(a.x + b.x) / 2, (a.y + b.y) / 2]);
+    } else {
+      setProbe(null);
+    }
+  }, [selection.a, selection.b]);
+
+  useEffect(() => {
+    if (!selection.a && !selection.b && source === 'pair') {
+      setSource('coil');
+    }
+  }, [selection.a, selection.b, source]);
+
+  useEffect(() => {
+    sim.current.dirty = true;
+  }, [
+    turns,
+    reversed,
+    showTurns,
+    source,
+    display,
+    density,
+    selection,
+    probe,
+    active,
+  ]);
+
+  // Main canvas: animation loop, drawing and pointer input.
+  useEffect(() => {
+    const stage = stageRef.current;
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    const S = sim.current;
+
+    let raf = 0;
+    let width = 0;
+    let height = 0;
+    let dpr = 1;
+
+    function resize() {
+      const rect = stage.getBoundingClientRect();
+      const w = Math.round(rect.width);
+      const h = Math.round(rect.height);
+      if (!w || !h) return;
+
+      width = w;
+      height = h;
+      dpr = Math.min(window.devicePixelRatio || 1, 2);
+      canvas.width = Math.round(w * dpr);
+      canvas.height = Math.round(h * dpr);
+
+      // Resizing clears the canvas, so repaint now rather than leave
+      // a blank frame until the next tick.
+      if (live.current.active) {
+        draw(currentGeo(performance.now()));
+        S.dirty = false;
+      } else {
+        S.dirty = true;
+      }
+    }
+
+    const resizeObserver = new ResizeObserver(resize);
+    resizeObserver.observe(stage);
+    resize();
+
+    function currentGeo(now) {
+      if (!S.anim) return { base: S.turns, E: null };
+
+      const t = sliceClamp(
+        (now - S.anim.start) / S.anim.duration,
+        0,
+        1,
+      );
+      const e = sliceEase(t);
+
+      return {
+        base: S.anim.base,
+        E: S.anim.kind === 'wrap' ? e : 1 - e,
+        done: t >= 1,
+      };
+    }
+
+    function draw(geo) {
+      const L = live.current;
+
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.fillStyle = SLICE_BG;
+      ctx.fillRect(0, 0, width, height);
+
+      /*
+       * Frame the coil as it is now, so a narrow screen is not zoomed
+       * out for ten turns it may never have. span follows the forming
+       * turn, so the framing eases out as each turn wraps. Wide screens
+       * are limited by height and never change scale.
+       */
+      const span = geo.base - 1 + (geo.E ?? 0);
+      const worldW =
+        Math.max(span + 1, 3) * SLICE_PITCH + SLICE_WORLD_MARGIN;
+      const scale = Math.min(
+        width / worldW,
+        height / SLICE_WORLD_H,
+      );
+
+      // Keep the wound coil centred, sliding as a turn forms.
+      const view = sliceView(
+        width,
+        height,
+        (Math.max(span, 0) / 2) * SLICE_PITCH,
+        0,
+        scale,
+      );
+      S.view = view;
+
+      // The progress bar fills continuously through each turn.
+      if (progressFillRef.current) {
+        progressFillRef.current.style.width = `${
+          ((geo.base + (geo.E ?? 0)) / SLICE_MAX_TURNS) * 100
+        }%`;
+      }
+
+      const wires = sliceCrossings(geo, L.dir);
+      const a = sliceCrossingFromId(L.selection.a, L.dir);
+      const b = sliceCrossingFromId(L.selection.b, L.dir);
+      const pair = [a, b].filter(Boolean);
+      const pairMode = L.source === 'pair' && pair.length > 0;
+      const fieldWires = pairMode ? pair : wires;
+
+      const markerR = Math.max(7, SLICE_WIRE_R * scale);
+      const runs = sliceCoilRuns(geo, view);
+
+      if (L.showTurns) {
+        ctx.save();
+        ctx.setLineDash([5, 6]);
+        ctx.lineCap = 'round';
+        ctx.strokeStyle = 'rgba(150, 168, 186, 0.3)';
+        ctx.lineWidth = Math.max(1.5, markerR * 0.32);
+        strokeRuns(ctx, runs.back);
+        ctx.restore();
+      }
+
+      const showLines = L.display !== 'strength';
+      const showStrength = L.display !== 'lines';
+
+      drawSliceField(ctx, view, fieldWires, {
+        step: 4,
+        cutoff: (markerR * 1.05) / scale,
+        spacing: L.spacing,
+        lines: showLines,
+        strength: showStrength,
+        strengthAlpha: showLines ? 0.62 : 1,
+        b0: 0.5,
+        bmax: 14,
+        lineColor: pairMode
+          ? 'rgba(232, 236, 255, 0.82)'
+          : 'rgba(118, 208, 255, 0.85)',
+        arrowColor: pairMode ? '#f2f4ff' : '#9fe3ff',
+        lineWidth: 1.25,
+        arrowCell: 84,
+        arrowMinDist: 36,
+        arrowSize: 9,
+        cache: S.cache,
+      });
+
+      /*
+       * The unwound wire lying in the page (its own field has no
+       * in-page part). It fades out to either side so it reads as the
+       * supply of wire still to wrap, not as part of the picture.
+       */
+      const coilLeft = sliceTurnX(0);
+      const coilRight = sliceTurnX(geo.base + (geo.E ?? 0));
+      const fade = ctx.createLinearGradient(
+        view.sx(coilLeft - 2.2),
+        0,
+        view.sx(coilRight + 7),
+        0,
+      );
+      const total = coilRight + 7 - (coilLeft - 2.2);
+      const near0 = 2 / total;
+      const near1 = (coilRight + 0.2 - (coilLeft - 2.2)) / total;
+
+      fade.addColorStop(0, 'rgba(176, 190, 204, 0)');
+      fade.addColorStop(sliceClamp(near0, 0, 1), 'rgba(176, 190, 204, 0.5)');
+      fade.addColorStop(sliceClamp(near1, 0, 1), 'rgba(176, 190, 204, 0.5)');
+      fade.addColorStop(1, 'rgba(176, 190, 204, 0)');
+
+      ctx.save();
+      ctx.lineCap = 'round';
+      ctx.strokeStyle = fade;
+      ctx.lineWidth = Math.max(2, markerR * 0.42);
+      strokeRuns(ctx, runs.plane);
+      ctx.restore();
+
+      if (L.showTurns) {
+        drawFrontRuns(ctx, runs.front, markerR * 1.3);
+
+        // Current direction on the front of each finished turn.
+        ctx.save();
+        ctx.fillStyle = SLICE_CURRENT_COLOR;
+        for (let i = 0; i < geo.base; i++) {
+          const [x, y] = view.project([sliceTurnX(i), 0, SLICE_R]);
+          sliceArrowhead(ctx, x, y, 0, L.dir, 11);
+        }
+        ctx.restore();
+      }
+
+      const selectedIds = new Set(pair.map((p) => p.id));
+
+      for (const w of wires) {
+        const ghost = pairMode && !selectedIds.has(w.id);
+        drawCrossingMarker(
+          ctx,
+          view.sx(w.x),
+          view.sy(w.y),
+          markerR,
+          w.I,
+          w.w * (ghost ? 0.3 : 1),
+        );
+      }
+
+      if (S.hover && !selectedIds.has(S.hover)) {
+        const h = sliceCrossingFromId(S.hover, L.dir);
+        ctx.save();
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.55)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(view.sx(h.x), view.sy(h.y), markerR + 5, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      if (a) {
+        drawSelectionRing(
+          ctx,
+          view.sx(a.x),
+          view.sy(a.y),
+          markerR,
+          SLICE_A_COLOR,
+          'A',
+          a.side === 'bottom',
+        );
+      }
+
+      if (b) {
+        drawSelectionRing(
+          ctx,
+          view.sx(b.x),
+          view.sy(b.y),
+          markerR,
+          SLICE_B_COLOR,
+          'B',
+          b.side === 'bottom',
+        );
+      }
+
+      // Poles once there is enough coil to have them.
+      const ends = geo.base + (geo.E ?? 0);
+      if (ends >= 2) {
+        const left = view.sx(sliceTurnX(0) - 0.78);
+        const right = view.sx(sliceTurnX(ends - 1) + 0.78);
+        const cy = view.sy(0);
+        drawPoleLabel(ctx, right, cy, L.dir > 0 ? 'N' : 'S');
+        drawPoleLabel(ctx, left, cy, L.dir > 0 ? 'S' : 'N');
+      }
+
+      if (a && b && L.probe) {
+        const fa = sliceFieldAt([a], L.probe[0], L.probe[1]);
+        const fb = sliceFieldAt([b], L.probe[0], L.probe[1]);
+        const biggest = Math.max(
+          Math.hypot(...fa),
+          Math.hypot(...fb),
+          1e-6,
+        );
+
+        drawProbe(
+          ctx,
+          view.sx(L.probe[0]),
+          view.sy(L.probe[1]),
+          [fa, fb],
+          Math.min(46 / biggest, 60),
+        );
+      }
+    }
+
+    function frame() {
+      raf = requestAnimationFrame(frame);
+
+      if (!live.current.active || !width || !height) return;
+
+      // Same clock as the animation's start time.
+      const geo = currentGeo(performance.now());
+
+      if (S.anim) {
+        S.dirty = true;
+
+        if (geo.done) {
+          const kind = S.anim.kind;
+          S.anim = null;
+          S.turns += kind === 'wrap' ? 1 : -1;
+          setTurns(S.turns);
+
+          // Carry on towards the target, or come to rest.
+          if (!S.next()) {
+            S.fast = false;
+            setAnimating(false);
+          }
+
+          draw(currentGeo(performance.now()));
+          S.dirty = false;
+          return;
+        }
+      }
+
+      if (!S.dirty) return;
+      S.dirty = false;
+      draw(geo);
+    }
+
+    raf = requestAnimationFrame(frame);
+
+    function toLocal(event) {
+      const rect = canvas.getBoundingClientRect();
+      return [event.clientX - rect.left, event.clientY - rect.top];
+    }
+
+    function crossingAt(px, py) {
+      const view = S.view;
+      if (!view) return null;
+
+      const base = S.anim ? S.anim.base : S.turns;
+      const reach = Math.max(14, SLICE_WIRE_R * view.scale + 6);
+      let best = null;
+      let bestD = reach;
+
+      for (let i = 0; i < base; i++) {
+        for (const id of [`t${i}`, `b${i}`]) {
+          const c = sliceCrossingFromId(id, 1);
+          const d = Math.hypot(view.sx(c.x) - px, view.sy(c.y) - py);
+          if (d < bestD) {
+            bestD = d;
+            best = id;
+          }
+        }
+      }
+
+      return best;
+    }
+
+    function overProbe(px, py) {
+      const p = live.current.probe;
+      const view = S.view;
+      if (!p || !view) return false;
+      return Math.hypot(view.sx(p[0]) - px, view.sy(p[1]) - py) < 16;
+    }
+
+    function onPointerDown(event) {
+      const [px, py] = toLocal(event);
+
+      if (overProbe(px, py)) {
+        S.drag = { id: event.pointerId };
+        canvas.setPointerCapture(event.pointerId);
+        canvas.style.cursor = 'grabbing';
+        return;
+      }
+
+      S.down = { x: px, y: py };
+    }
+
+    function onPointerMove(event) {
+      const [px, py] = toLocal(event);
+
+      if (S.drag) {
+        const view = S.view;
+        setProbe([view.wx(px), view.wy(py)]);
+        return;
+      }
+
+      const hit = crossingAt(px, py);
+      if (hit !== S.hover) {
+        S.hover = hit;
+        S.dirty = true;
+      }
+
+      canvas.style.cursor = overProbe(px, py)
+        ? 'grab'
+        : hit
+          ? 'pointer'
+          : 'default';
+    }
+
+    function onPointerUp(event) {
+      const [px, py] = toLocal(event);
+
+      if (S.drag) {
+        S.drag = null;
+        canvas.releasePointerCapture(event.pointerId);
+        canvas.style.cursor = 'grab';
+        return;
+      }
+
+      const down = S.down;
+      S.down = null;
+      if (!down || Math.hypot(px - down.x, py - down.y) > 6) return;
+
+      const id = crossingAt(px, py);
+      if (!id) return;
+
+      setSelection((prev) => {
+        let { a, b } = prev;
+        if (a === id) a = null;
+        else if (b === id) b = null;
+        else if (!a) a = id;
+        else b = id;
+        return { a, b };
+      });
+    }
+
+    function onPointerLeave() {
+      if (S.hover) {
+        S.hover = null;
+        S.dirty = true;
+      }
+    }
+
+    canvas.addEventListener('pointerdown', onPointerDown);
+    canvas.addEventListener('pointermove', onPointerMove);
+    canvas.addEventListener('pointerup', onPointerUp);
+    canvas.addEventListener('pointerleave', onPointerLeave);
+
+    // Start wrapping or unwrapping the next turn towards S.target.
+    S.next = () => {
+      if (S.anim || S.target === S.turns) return false;
+
+      const kind = S.target > S.turns ? 'wrap' : 'unwrap';
+
+      S.anim = {
+        kind,
+        base: kind === 'wrap' ? S.turns : S.turns - 1,
+        start: performance.now(),
+        duration: S.fast ? SLICE_JUMP_MS : SLICE_WRAP_MS,
+      };
+      S.dirty = true;
+      return true;
+    };
+
+    return () => {
+      cancelAnimationFrame(raf);
+      resizeObserver.disconnect();
+      canvas.removeEventListener('pointerdown', onPointerDown);
+      canvas.removeEventListener('pointermove', onPointerMove);
+      canvas.removeEventListener('pointerup', onPointerUp);
+      canvas.removeEventListener('pointerleave', onPointerLeave);
+    };
+  }, []);
+
+  // Redraw the comparison panels when their size changes.
+  useEffect(() => {
+    const host = compareRef.current;
+    if (!host) return undefined;
+
+    const resizeObserver = new ResizeObserver(() =>
+      setMiniTick((t) => t + 1),
+    );
+    resizeObserver.observe(host);
+    return () => resizeObserver.disconnect();
+  }, []);
+
+  // Comparison panels: A alone, B alone, A + B.
+  useEffect(() => {
+    if (!active) return;
+
+    const a = sliceCrossingFromId(selection.a, dir);
+    const b = sliceCrossingFromId(selection.b, dir);
+    const ghosts = sliceCrossings({ base: turns, E: null }, dir);
+
+    const panels = [
+      { wires: a ? [a] : [], color: 'rgba(255, 181, 71, 0.85)', arrow: SLICE_A_COLOR },
+      { wires: b ? [b] : [], color: 'rgba(255, 95, 168, 0.85)', arrow: SLICE_B_COLOR },
+      { wires: [a, b].filter(Boolean), color: 'rgba(240, 244, 255, 0.85)', arrow: '#ffffff' },
+    ];
+
+    // One crop for all three so they compare like for like.
+    const anchor = [a, b].filter(Boolean);
+    const pts = anchor.map((c) => [c.x, c.y]);
+    if (probe) pts.push(probe);
+
+    let minX = -1.2;
+    let maxX = 1.2;
+    let minY = -1.2;
+    let maxY = 1.2;
+
+    if (pts.length) {
+      minX = Math.min(...pts.map((p) => p[0])) - 0.8;
+      maxX = Math.max(...pts.map((p) => p[0])) + 0.8;
+      minY = Math.min(...pts.map((p) => p[1])) - 0.8;
+      maxY = Math.max(...pts.map((p) => p[1])) + 0.8;
+    }
+
+    const fa = a && probe ? sliceFieldAt([a], probe[0], probe[1]) : null;
+    const fb = b && probe ? sliceFieldAt([b], probe[0], probe[1]) : null;
+
+    panels.forEach((panel, k) => {
+      const canvas = miniRefs.current[k];
+      if (!canvas) return;
+
+      const rect = canvas.getBoundingClientRect();
+      const w = Math.round(rect.width);
+      const h = Math.round(rect.height);
+      if (!w || !h) return;
+
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      canvas.width = Math.round(w * dpr);
+      canvas.height = Math.round(h * dpr);
+
+      const ctx = canvas.getContext('2d');
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.fillStyle = '#060a10';
+      ctx.fillRect(0, 0, w, h);
+
+      if (!anchor.length) return;
+
+      const scale = Math.min(w / (maxX - minX), h / (maxY - minY));
+      const view = sliceView(
+        w,
+        h,
+        (minX + maxX) / 2,
+        (minY + maxY) / 2,
+        scale,
+      );
+      const markerR = Math.max(6, SLICE_WIRE_R * scale);
+
+      if (panel.wires.length) {
+        drawSliceField(ctx, view, panel.wires, {
+          step: 3,
+          cutoff: (markerR * 1.05) / scale,
+          spacing: spacing * 0.55,
+          lines: display !== 'strength',
+          strength: display !== 'lines',
+          strengthAlpha: display === 'strength' ? 1 : 0.6,
+          b0: 0.35,
+          bmax: 7,
+          lineColor: panel.color,
+          arrowColor: panel.arrow,
+          lineWidth: 1.1,
+          arrowCell: 60,
+          arrowMinDist: 26,
+          arrowSize: 7,
+          cache: {},
+        });
+      }
+
+      // The rest of the coil, faintly, for context.
+      for (const g of ghosts) {
+        if (g.id === selection.a || g.id === selection.b) continue;
+        drawCrossingMarker(ctx, view.sx(g.x), view.sy(g.y), markerR * 0.85, g.I, 0.16);
+      }
+
+      for (const c of anchor) {
+        const on = panel.wires.includes(c);
+        drawCrossingMarker(ctx, view.sx(c.x), view.sy(c.y), markerR, c.I, on ? 1 : 0.28);
+        if (on) {
+          drawSelectionRing(
+            ctx,
+            view.sx(c.x),
+            view.sy(c.y),
+            markerR,
+            c === a ? SLICE_A_COLOR : SLICE_B_COLOR,
+            null,
+            false,
+          );
+        }
+      }
+
+      if (probe && fa && fb) {
+        const biggest = Math.max(Math.hypot(...fa), Math.hypot(...fb), 1e-6);
+        const unit = (Math.min(w, h) * 0.24) / biggest;
+        const px = view.sx(probe[0]);
+        const py = view.sy(probe[1]);
+
+        if (k === 0) {
+          sliceVector(ctx, px, py, fa[0] * unit, -fa[1] * unit, SLICE_A_COLOR, 3);
+        } else if (k === 1) {
+          sliceVector(ctx, px, py, fb[0] * unit, -fb[1] * unit, SLICE_B_COLOR, 3);
+        } else {
+          // Tip to tail: A, then B from A's tip, then the sum.
+          const ax = fa[0] * unit;
+          const ay = -fa[1] * unit;
+          sliceVector(ctx, px, py, ax, ay, SLICE_A_COLOR, 2.5);
+          sliceVector(ctx, px + ax, py + ay, fb[0] * unit, -fb[1] * unit, SLICE_B_COLOR, 2.5);
+          sliceVector(
+            ctx,
+            px,
+            py,
+            (fa[0] + fb[0]) * unit,
+            -(fa[1] + fb[1]) * unit,
+            '#ffffff',
+            3.5,
+          );
+        }
+
+        ctx.beginPath();
+        ctx.arc(px, py, 3, 0, Math.PI * 2);
+        ctx.fillStyle = '#ffffff';
+        ctx.fill();
+      }
+    });
+  }, [active, selection.a, selection.b, probe, dir, turns, spacing, display, miniTick]);
+
+  /*
+   * Head for a turn count. Turns always wrap one at a time; a jump of
+   * more than one turn plays each quickly. Crossings on turns that are
+   * going away are deselected straight away.
+   */
+  function requestTurns(target) {
+    const S = sim.current;
+    const goal = sliceClamp(Math.round(target), 0, SLICE_MAX_TURNS);
+
+    if (goal === S.target) return;
+
+    S.fast = Boolean(S.anim) || Math.abs(goal - S.turns) > 1;
+    S.target = goal;
+
+    const keep = (id) =>
+      id && Number(id.slice(1)) >= goal ? null : id;
+    setSelection((prev) => ({ a: keep(prev.a), b: keep(prev.b) }));
+
+    if (S.next?.()) setAnimating(true);
+  }
+
+  function handleWrap() {
+    requestTurns(turns + 1);
+  }
+
+  function handleUnwrap() {
+    requestTurns(turns - 1);
+  }
+
+  function turnsAtPointer(event) {
+    const rect = event.currentTarget.getBoundingClientRect();
+    const f = (event.clientX - rect.left) / rect.width;
+    return sliceClamp(f, 0, 1) * SLICE_MAX_TURNS;
+  }
+
+  function handleProgressKey(event) {
+    const step = {
+      ArrowRight: 1,
+      ArrowUp: 1,
+      ArrowLeft: -1,
+      ArrowDown: -1,
+    }[event.key];
+
+    if (!step) return;
+    event.preventDefault();
+    requestTurns(sim.current.target + step);
+  }
+
+  function pickNeighbours() {
+    if (turns < 2) return;
+    const i = Math.max(0, Math.floor((turns - 2) / 2));
+    setSelection({ a: `t${i}`, b: `t${i + 1}` });
+  }
+
+  function pickOpposite() {
+    if (turns < 1) return;
+    const i = Math.floor((turns - 1) / 2);
+    setSelection({ a: `t${i}`, b: `b${i}` });
+  }
+
+  const verdict = readout
+    ? readout.agreement < 0.35
+      ? 'cancel'
+      : readout.agreement > 0.8
+        ? 'add'
+        : 'partial'
+    : null;
+
+  const verdictLabel = {
+    cancel: 'They cancel',
+    add: 'They add',
+    partial: 'Partly',
+  }[verdict];
+
+  let explanation = '';
+  if (readout) {
+    if (readout.agreement < 0.2) {
+      explanation =
+        'At the probe their fields point opposite ways, so they cancel almost completely.';
+    } else if (readout.agreement < 0.6) {
+      explanation =
+        'At the probe their fields mostly oppose each other, so they partly cancel.';
+    } else if (readout.agreement < 0.97) {
+      explanation = `At the probe their fields are ${Math.round(
+        readout.angle,
+      )}° apart, so they ${
+        readout.agreement > 0.8 ? 'mostly' : 'partly'
+      } add.`;
+    } else {
+      explanation =
+        'At the probe their fields point the same way, so they add.';
+    }
+  }
+
+  const barMax = readout
+    ? Math.max(readout.ma + readout.mb, readout.mc, 1e-6)
+    : 1;
+
+  const bars = readout
+    ? [
+        { label: 'A alone', value: readout.ma, cls: 'bar-a' },
+        { label: 'B alone', value: readout.mb, cls: 'bar-b' },
+        { label: 'A + B', value: readout.ms, cls: 'bar-sum' },
+        {
+          label: `Whole coil`,
+          value: readout.mc,
+          cls: 'bar-coil',
+        },
+      ]
+    : [];
+
+  const miniLabels = ['A alone', 'B alone', 'A + B'];
+
+  return (
+    <div className="magnetic-app">
+      <style>{`
+        .slice-panel {
+          display: grid;
+          grid-template-rows: auto minmax(0, 1fr) auto auto;
+        }
+
+        .slice-progress {
+          padding: 2px 22px 12px;
+          background: rgba(3, 8, 14, 0.66);
+        }
+
+        .slice-progress .progress-hit {
+          outline: none;
+        }
+
+        .slice-progress .progress-hit:focus-visible .progress-bar {
+          border-color: rgba(98, 230, 255, 0.6);
+        }
+
+        /* The draw loop moves the fill every frame, so no easing. */
+        .slice-fill {
+          transition: none;
+        }
+
+        /* One tick per turn. */
+        .slice-bar::after {
+          content: '';
+          position: absolute;
+          inset: 0;
+          background: repeating-linear-gradient(
+            90deg,
+            transparent 0,
+            transparent calc(10% - 1px),
+            rgba(5, 8, 13, 0.9) calc(10% - 1px),
+            rgba(5, 8, 13, 0.9) 10%
+          );
+          pointer-events: none;
+        }
+
+        .slice-top {
+          position: relative;
+          z-index: 2;
+          display: grid;
+          grid-template-columns: minmax(300px, 1fr) auto;
+          grid-template-areas:
+            "title controls"
+            "help  controls";
+          grid-template-rows: auto 1fr;
+          column-gap: 24px;
+          row-gap: 12px;
+          align-items: start;
+          padding: 20px 20px 8px 22px;
+        }
+
+        .slice-top .top-controls {
+          gap: 8px;
+        }
+
+        .slice-sub {
+          margin: 8px 0 0;
+          color: #8fb1c1;
+          font-size: 12.5px;
+          line-height: 1.4;
+        }
+
+        .slice-slider {
+          grid-template-columns: 200px;
+          padding: 9px 14px 10px;
+        }
+
+        .segment:disabled {
+          opacity: 0.35;
+          cursor: default;
+        }
+
+        .slice-toggle {
+          display: inline-flex;
+          align-items: center;
+          gap: 7px;
+          padding: 9px 12px;
+          border: 1px solid rgba(147, 212, 240, 0.22);
+          border-radius: 12px;
+          background: rgba(8, 20, 30, 0.78);
+          color: #d6ebf5;
+          font-size: 12px;
+          font-weight: 800;
+          white-space: nowrap;
+          cursor: pointer;
+        }
+
+        .slice-toggle input {
+          accent-color: #47c8ff;
+          width: 15px;
+          height: 15px;
+          margin: 0;
+        }
+
+        .slice-stage {
+          position: relative;
+          min-height: 0;
+          overflow: hidden;
+        }
+
+        .slice-stage canvas {
+          position: absolute;
+          inset: 0;
+          width: 100%;
+          height: 100%;
+          display: block;
+          touch-action: none;
+        }
+
+        .slice-legend {
+          position: absolute;
+          left: 22px;
+          bottom: 12px;
+          display: flex;
+          flex-wrap: wrap;
+          gap: 6px 14px;
+          padding: 8px 11px;
+          border-radius: 11px;
+          background: rgba(5, 12, 20, 0.9);
+          border: 1px solid rgba(160, 218, 240, 0.12);
+          color: #9fbccb;
+          font-size: 11px;
+          pointer-events: none;
+        }
+
+        .slice-legend span {
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+          white-space: nowrap;
+        }
+
+        .slice-legend .sym {
+          color: #ff4a5a;
+          font-size: 14px;
+          line-height: 1;
+        }
+
+        .slice-legend .swatch-line {
+          width: 18px;
+          height: 2px;
+          border-radius: 2px;
+          background: #76d0ff;
+        }
+
+        .slice-legend .swatch-heat {
+          width: 26px;
+          height: 8px;
+          border-radius: 4px;
+          background: linear-gradient(90deg, #0a224e, #1060a4, #46bae8, #daf7ff);
+        }
+
+        .slice-compare {
+          display: grid;
+          grid-template-columns:
+            repeat(3, minmax(0, 1fr))
+            minmax(280px, 1.25fr);
+          grid-template-rows: auto auto;
+          gap: 10px 12px;
+          padding: 12px 20px 8px 22px;
+          border-top: 1px solid rgba(145, 211, 239, 0.12);
+          background: rgba(3, 8, 14, 0.66);
+        }
+
+        .compare-head {
+          grid-column: 1 / -1;
+          display: flex;
+          flex-wrap: wrap;
+          align-items: center;
+          justify-content: space-between;
+          gap: 8px 16px;
+        }
+
+        .compare-title {
+          display: flex;
+          flex: 1 1 0;
+          align-items: baseline;
+          gap: 10px;
+          min-width: 0;
+          overflow: hidden;
+        }
+
+        .compare-title > span {
+          white-space: nowrap;
+        }
+
+        .compare-current {
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+
+        .compare-kicker {
+          font-size: 11px;
+          letter-spacing: 0.14em;
+          text-transform: uppercase;
+          color: #7fc5e5;
+          font-weight: 750;
+        }
+
+        .compare-where {
+          color: #eaf8ff;
+          font-size: 13px;
+          font-weight: 750;
+        }
+
+        .compare-current {
+          color: #8fb1c1;
+          font-size: 12px;
+        }
+
+        /*
+         * Panels and verdict share one fixed height so the strip never
+         * changes size with its content, which would resize the slice.
+         */
+        .mini {
+          position: relative;
+          height: 176px;
+          border-radius: 12px;
+          border: 1px solid rgba(160, 218, 240, 0.12);
+          overflow: hidden;
+          background: #060a10;
+        }
+
+        .mini canvas {
+          display: block;
+          width: 100%;
+          height: 100%;
+        }
+
+        .mini-chip {
+          position: absolute;
+          left: 8px;
+          top: 8px;
+          padding: 3px 8px;
+          border-radius: 999px;
+          font-size: 11px;
+          font-weight: 800;
+          background: rgba(5, 10, 16, 0.82);
+          border: 1px solid currentColor;
+        }
+
+        .mini-chip.chip-0 { color: ${SLICE_A_COLOR}; }
+        .mini-chip.chip-1 { color: ${SLICE_B_COLOR}; }
+        .mini-chip.chip-2 { color: #ffffff; }
+
+        .mini-empty {
+          position: absolute;
+          inset: 0;
+          display: grid;
+          place-items: center;
+          padding: 16px;
+          color: #5f7d8c;
+          font-size: 12px;
+          text-align: center;
+        }
+
+        .verdict {
+          display: flex;
+          flex-direction: column;
+          gap: 10px;
+          height: 176px;
+          overflow: auto;
+          min-width: 0;
+          padding: 12px 14px;
+          border-radius: 12px;
+          border: 1px solid rgba(160, 218, 240, 0.12);
+          background: rgba(5, 14, 22, 0.78);
+        }
+
+        .verdict-badge {
+          display: inline-block;
+          margin-right: 8px;
+          padding: 2px 9px;
+          border-radius: 999px;
+          font-size: 12px;
+          font-weight: 850;
+          letter-spacing: 0.02em;
+        }
+
+        .verdict-badge.cancel {
+          color: #ffd9a8;
+          background: rgba(120, 70, 10, 0.35);
+          border: 1px solid rgba(255, 181, 71, 0.45);
+        }
+
+        .verdict-badge.add {
+          color: #c9f6ff;
+          background: rgba(20, 110, 150, 0.35);
+          border: 1px solid rgba(98, 230, 255, 0.5);
+        }
+
+        .verdict-badge.partial {
+          color: #e6dcff;
+          background: rgba(70, 60, 120, 0.3);
+          border: 1px solid rgba(180, 170, 255, 0.4);
+        }
+
+        .verdict-text {
+          margin: 0;
+          color: #b7cfdb;
+          font-size: 12px;
+          line-height: 1.45;
+        }
+
+        .bars {
+          display: grid;
+          grid-template-columns: auto minmax(0, 1fr) auto;
+          align-items: center;
+          gap: 5px 9px;
+          font-size: 11px;
+          color: #9fbccb;
+        }
+
+        .bar-track {
+          display: block;
+          height: 7px;
+          border-radius: 999px;
+          background: rgba(127, 197, 229, 0.09);
+          overflow: hidden;
+        }
+
+        .bar-fill {
+          height: 100%;
+          border-radius: inherit;
+          transition: width .2s ease;
+        }
+
+        .bar-a .bar-fill { background: ${SLICE_A_COLOR}; }
+        .bar-b .bar-fill { background: ${SLICE_B_COLOR}; }
+        .bar-sum .bar-fill { background: #ffffff; }
+        .bar-coil .bar-fill { background: linear-gradient(90deg, #47c8ff, #8a8dff); }
+
+        .bar-value {
+          color: #dcefff;
+          font-weight: 700;
+          font-variant-numeric: tabular-nums;
+          text-align: right;
+        }
+
+        .verdict-empty {
+          color: #9fbccb;
+          font-size: 12px;
+          line-height: 1.5;
+        }
+
+        @media (max-width: 940px) {
+          .slice-compare {
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+          }
+
+          .verdict {
+            grid-column: 1 / -1;
+            height: 140px;
+          }
+
+          .mini {
+            height: 140px;
+          }
+        }
+
+        @media (max-width: 820px) {
+          .slice-panel {
+            height: auto;
+            min-height: 100vh;
+            overflow: visible;
+          }
+
+          .slice-top {
+            grid-template-columns: minmax(0, 1fr);
+            grid-template-areas:
+              "title"
+              "controls"
+              "help";
+            padding: 16px 16px 8px 18px;
+          }
+
+          .slice-top .top-controls {
+            justify-self: stretch;
+            align-items: flex-start;
+          }
+
+          .slice-top .toolbar {
+            justify-content: flex-start;
+          }
+
+          .slice-stage {
+            height: 58vh;
+            min-height: 320px;
+          }
+
+          .slice-compare {
+            padding: 12px 16px 8px;
+          }
+
+          .slice-progress {
+            padding: 2px 16px 14px;
+          }
+
+          .slice-legend {
+            left: 12px;
+            right: 12px;
+          }
+
+          .verdict {
+            height: auto;
+          }
+        }
+
+        @media (max-width: 520px) {
+          .slice-compare {
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 8px;
+          }
+
+          .compare-title {
+            flex-basis: 100%;
+            flex-wrap: wrap;
+            row-gap: 2px;
+          }
+
+          .compare-title > span {
+            white-space: normal;
+          }
+
+          .mini {
+            height: 110px;
+          }
+
+          .mini-chip {
+            font-size: 10px;
+            padding: 2px 6px;
+          }
+        }
+      `}</style>
+
+      <div className="magnetic-panel slice-panel">
+        <header className="slice-top">
+          <div className="top-title">
+            <div className="kicker">
+              Magnetism · Cross-section
+            </div>
+
+            <h1 className="title">
+              Slice through the solenoid
+            </h1>
+
+            <p className="slice-sub">
+              Each turn pierces the page twice. Click two crossings
+              to compare their fields.
+            </p>
+          </div>
+
+          <div className="top-controls">
+            <div className="toolbar">
+              <div
+                className="toolbar-group"
+                role="group"
+                aria-label="Overlays"
+              >
+                <button
+                  type="button"
+                  className="current-toggle reverse-button"
+                  onClick={() => setReversed((r) => !r)}
+                  title="Reverse the current, flipping every field and swapping the poles"
+                >
+                  <span className="reverse-icon" aria-hidden="true">⇄</span>
+                  <span>Reverse current</span>
+                </button>
+
+                <label className="slice-toggle">
+                  <input
+                    type="checkbox"
+                    checked={showTurns}
+                    onChange={(e) => setShowTurns(e.target.checked)}
+                  />
+                  <span>Show turns</span>
+                </label>
+              </div>
+            </div>
+
+            <div className="toolbar">
+              <div
+                className="segmented"
+                role="group"
+                aria-label="Field source"
+              >
+                <button
+                  className={`segment ${source === 'coil' ? 'active' : ''}`}
+                  aria-pressed={source === 'coil'}
+                  onClick={() => setSource('coil')}
+                >
+                  Whole coil
+                </button>
+
+                <button
+                  className={`segment ${source === 'pair' ? 'active' : ''}`}
+                  aria-pressed={source === 'pair'}
+                  onClick={() => setSource('pair')}
+                  disabled={!selection.a && !selection.b}
+                  title={
+                    !selection.a && !selection.b
+                      ? 'Select a crossing first'
+                      : undefined
+                  }
+                >
+                  Selected only
+                </button>
+              </div>
+
+              <div
+                className="segmented"
+                role="group"
+                aria-label="Field display"
+              >
+                {[
+                  ['lines', 'Lines'],
+                  ['strength', 'Strength'],
+                  ['both', 'Both'],
+                ].map(([key, label]) => (
+                  <button
+                    key={key}
+                    className={`segment ${display === key ? 'active' : ''}`}
+                    aria-pressed={display === key}
+                    onClick={() => setDisplay(key)}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="slider-panel slice-slider">
+              <SliderField
+                label="Line density"
+                valueText={density}
+                value={density}
+                min={6}
+                max={24}
+                step={1}
+                onChange={(e) => setDensity(Number(e.target.value))}
+                disabled={display === 'strength'}
+                disabledHint="Only used when field lines are shown"
+              />
+            </div>
+          </div>
+        </header>
+
+        <div ref={stageRef} className="slice-stage">
+          <canvas
+            ref={canvasRef}
+            aria-label="Cross-section of the solenoid with its magnetic field"
+          />
+
+          <div className="slice-legend" aria-hidden="true">
+            <span>
+              <i className="sym">⊙</i> out of page
+            </span>
+            <span>
+              <i className="sym">⊗</i> into page
+            </span>
+            {display !== 'strength' && (
+              <span>
+                <i className="swatch-line" /> field line · closer = stronger
+              </span>
+            )}
+            {display !== 'lines' && (
+              <span>
+                <i className="swatch-heat" /> field strength
+              </span>
+            )}
+          </div>
+        </div>
+
+        <section
+          ref={compareRef}
+          className="slice-compare"
+          aria-label="Compare two crossings"
+        >
+          <div className="compare-head">
+            <div className="compare-title">
+              <span className="compare-kicker">Compare</span>
+              {relation ? (
+                <>
+                  <span className="compare-where">{relation.where}</span>
+                  <span className="compare-current">
+                    {relation.current} · drag the white probe to test
+                    other points
+                  </span>
+                </>
+              ) : (
+                <span className="compare-current">
+                  Pick crossing A and crossing B on the slice
+                </span>
+              )}
+            </div>
+
+            <div className="toolbar-group">
+              <button
+                className="control"
+                onClick={pickNeighbours}
+                disabled={turns < 2}
+                title="Two neighbouring turns on the same side"
+              >
+                Neighbours
+              </button>
+              <button
+                className="control"
+                onClick={pickOpposite}
+                disabled={turns < 1}
+                title="The top and bottom of one turn"
+              >
+                Opposite sides
+              </button>
+              <button
+                className="control"
+                onClick={() => setSelection({ a: null, b: null })}
+                disabled={!selection.a && !selection.b}
+              >
+                Clear
+              </button>
+            </div>
+          </div>
+
+          {miniLabels.map((label, k) => (
+            <div className="mini" key={label}>
+              <canvas
+                ref={(el) => {
+                  miniRefs.current[k] = el;
+                }}
+              />
+              <span className={`mini-chip chip-${k}`}>{label}</span>
+              {!pairReady && (
+                <span className="mini-empty">
+                  {k === 0
+                    ? selection.a
+                      ? ''
+                      : 'Click a crossing to make it A'
+                    : k === 1
+                      ? selection.b
+                        ? ''
+                        : 'Then another to make it B'
+                      : 'Their combined field appears here'}
+                </span>
+              )}
+            </div>
+          ))}
+
+          <div className="verdict" aria-live="polite">
+            {readout ? (
+              <>
+                <p className="verdict-text">
+                  <span className={`verdict-badge ${verdict}`}>
+                    {verdictLabel}
+                  </span>
+                  {explanation}
+                </p>
+
+                <div className="bars">
+                  {bars.map((bar) => (
+                    <div className={`${bar.cls}`} key={bar.label} style={{ display: 'contents' }}>
+                      <span>{bar.label}</span>
+                      <span className="bar-track">
+                        <span
+                          className="bar-fill"
+                          style={{
+                            display: 'block',
+                            width: `${(bar.value / barMax) * 100}%`,
+                          }}
+                        />
+                      </span>
+                      <span className="bar-value">
+                        {bar.value.toFixed(2)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <span className="verdict-empty">
+                Try <b>Neighbours</b>: two turns side by side carry
+                current the same way, so between them their fields
+                oppose. Then try <b>Opposite sides</b>: the top and
+                bottom of a turn carry current opposite ways, so inside
+                the coil their fields line up.
+              </span>
+            )}
+          </div>
+        </section>
+
+        <div className="slice-progress">
+          <div className="progress-meta">
+            <span>
+              {turns} of {SLICE_MAX_TURNS} turns wrapped
+            </span>
+
+            <span>
+              {turns === SLICE_MAX_TURNS
+                ? 'Coil complete'
+                : 'Click the bar to jump to a turn count'}
+            </span>
+          </div>
+
+          {/* Unwrap · Wrap · progress */}
+          <div
+            className="progress-row"
+            onPointerDownCapture={() => setBarAttention(false)}
+          >
+            <button
+              className="control"
+              onClick={handleUnwrap}
+              disabled={animating || turns <= 0}
+            >
+              Unwrap
+            </button>
+
+            <button
+              className="control primary"
+              onClick={handleWrap}
+              disabled={animating || turns >= SLICE_MAX_TURNS}
+            >
+              Wrap
+            </button>
+
+            <div
+              className="progress-hit"
+              role="slider"
+              tabIndex={0}
+              aria-label="Turns wrapped"
+              aria-valuemin={0}
+              aria-valuemax={SLICE_MAX_TURNS}
+              aria-valuenow={turns}
+              onClick={(e) => requestTurns(turnsAtPointer(e))}
+              onPointerMove={(e) => {
+                if (e.buttons & 1) requestTurns(turnsAtPointer(e));
+              }}
+              onKeyDown={handleProgressKey}
+            >
+              {barAttention && (
+                <span className="bar-hint" aria-hidden="true">
+                  Click here
+                </span>
+              )}
+
+              <div
+                className={`progress-bar slice-bar${
+                  barAttention ? ' attention' : ''
+                }`}
+              >
+                <div
+                  ref={progressFillRef}
+                  className="progress-fill slice-fill"
+                  style={{
+                    width: `${(turns / SLICE_MAX_TURNS) * 100}%`,
+                  }}
+                />
+              </div>
+            </div>
+          </div>
+
+          <div className="progress-switch">
+            {switcher}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ScreenSwitcher({ screen, onChange }) {
+  const tabs = [
+    ['coil', '3D coil'],
+    ['slice', 'Cross-section'],
+  ];
+
+  return (
+    <div
+      className="screen-switcher"
+      role="tablist"
+      aria-label="Choose a view"
+    >
+      {tabs.map(([key, label]) => (
+        <button
+          key={key}
+          type="button"
+          role="tab"
+          aria-selected={screen === key}
+          className={`screen-tab${screen === key ? ' active' : ''}`}
+          onClick={() => onChange(key)}
+        >
+          {label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+export default function App() {
+  const [screen, setScreen] = useState('coil');
+  const [sliceOpened, setSliceOpened] = useState(false);
+
+  function changeScreen(next) {
+    if (next === 'slice') setSliceOpened(true);
+    setScreen(next);
+  }
+
+  const switcher = (
+    <ScreenSwitcher screen={screen} onChange={changeScreen} />
+  );
+
+  return (
+    <>
+      <style>{`
+        .screen-host[hidden] {
+          display: none !important;
+        }
+
+        .screen-switcher {
+          display: inline-flex;
+          gap: 2px;
+          padding: 2px;
+          border: 1px solid rgba(147, 212, 240, 0.18);
+          border-radius: 11px;
+          background: rgba(8, 20, 30, 0.78);
+          backdrop-filter: blur(10px);
+          pointer-events: auto;
+        }
+
+        .screen-tab {
+          padding: 6px 12px;
+          border: 1px solid transparent;
+          border-radius: 8px;
+          background: transparent;
+          color: #a9c6d3;
+          font: inherit;
+          font-size: 11.5px;
+          font-weight: 750;
+          white-space: nowrap;
+          cursor: pointer;
+          transition:
+            background .15s ease,
+            border-color .15s ease,
+            color .15s ease;
+        }
+
+        .screen-tab:hover:not(.active) {
+          background: rgba(11, 32, 45, 0.9);
+          color: #eaf8ff;
+        }
+
+        .screen-tab.active {
+          border-color: #62e6ff;
+          background: rgba(23, 83, 105, 0.95);
+          color: #eaf8ff;
+          box-shadow: 0 0 14px rgba(98, 230, 255, 0.18);
+        }
+
+        .screen-tab:focus-visible {
+          outline: 2px solid rgba(98, 230, 255, 0.6);
+          outline-offset: 1px;
+        }
+      `}</style>
+
+      <div className="screen-host" hidden={screen !== 'coil'}>
+        <CoilView switcher={switcher} />
+      </div>
+
+      {sliceOpened && (
+        <div className="screen-host" hidden={screen !== 'slice'}>
+          <SliceView switcher={switcher} active={screen === 'slice'} />
+        </div>
+      )}
+    </>
   );
 }
