@@ -6,7 +6,7 @@ import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
 import { LineGeometry } from 'three/addons/lines/LineGeometry.js';
 import BuyMeCoffeeButton from './BuyMeCoffee.jsx';
 
-const SITE_URL = 'https://awm11.github.io/';
+const SITE_URL = '/';
 
 // public/favicon.svg, resolved against the app's base path so it still
 // loads when the app is served from a sub-folder.
