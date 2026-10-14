@@ -7840,7 +7840,7 @@ function SliceView({ switcher, active }) {
       <style>{`
         .slice-panel {
           display: grid;
-          grid-template-rows: auto minmax(0, 1fr) auto auto;
+          grid-template-rows: minmax(0, 1fr) auto auto;
         }
 
         .slice-progress {
@@ -7876,9 +7876,15 @@ function SliceView({ switcher, active }) {
           pointer-events: none;
         }
 
+        /* The header floats over the stage so the sim gets the full height.
+           Clicks on the title pass through to the canvas beneath. */
         .slice-top {
-          position: relative;
+          position: absolute;
+          top: 0;
+          left: 0;
+          right: 0;
           z-index: 2;
+          pointer-events: none;
           display: grid;
           grid-template-columns: minmax(300px, 1fr) auto;
           grid-template-areas:
@@ -8218,9 +8224,12 @@ function SliceView({ switcher, active }) {
             height: auto;
             min-height: 100vh;
             overflow: visible;
+            grid-template-rows: auto minmax(0, 1fr) auto auto;
           }
 
           .slice-top {
+            position: relative;
+            pointer-events: auto;
             grid-template-columns: minmax(0, 1fr);
             grid-template-areas:
               "title"
