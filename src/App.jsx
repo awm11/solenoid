@@ -7893,8 +7893,13 @@ function SliceView({ switcher, active }) {
           padding: 20px 20px 8px 22px;
         }
 
+        /* All controls on a single row to leave more height for the stage */
         .slice-top .top-controls {
-          gap: 8px;
+          flex-direction: row;
+          flex-wrap: wrap;
+          justify-content: flex-end;
+          align-items: center;
+          gap: 8px 14px;
         }
 
         .slice-sub {
@@ -7905,8 +7910,23 @@ function SliceView({ switcher, active }) {
         }
 
         .slice-slider {
-          grid-template-columns: 200px;
-          padding: 9px 14px 10px;
+          grid-template-columns: auto;
+          padding: 7px 12px;
+        }
+
+        .slice-slider .slider-field {
+          flex-direction: row;
+          align-items: center;
+          gap: 10px;
+        }
+
+        .slice-slider .slider-head {
+          gap: 8px;
+        }
+
+        .slice-slider .slider-input {
+          flex: 0 0 120px;
+          width: 120px;
         }
 
         .segment:disabled {
@@ -8220,7 +8240,7 @@ function SliceView({ switcher, active }) {
 
           .slice-top .top-controls {
             justify-self: stretch;
-            align-items: flex-start;
+            justify-content: flex-start;
           }
 
           .slice-top .toolbar {
