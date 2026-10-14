@@ -4346,7 +4346,7 @@ function CoilView({ switcher }) {
           width: 100%;
           min-height: 100svh;
           margin: 0;
-          padding: 16px;
+          padding: 8px;
           display: grid;
           place-items: center;
           background:
@@ -4375,13 +4375,10 @@ function CoilView({ switcher }) {
         .magnetic-panel {
           position: relative;
           width: min(1600px, 100%);
-          height: min(
-            960px,
-            calc(100svh - 32px)
-          );
+          height: calc(100svh - 16px);
           min-height: min(
             640px,
-            calc(100svh - 32px)
+            calc(100svh - 16px)
           );
           overflow: hidden;
           border: 1px solid
@@ -6189,6 +6186,8 @@ const SLICE_TURN_LENGTH = Math.PI * 2 * SLICE_R;
 
 // World height kept in view; the width follows the coil (see draw).
 const SLICE_WORLD_H = 4.5;
+// Below 1 zooms out, showing more of the field around the coil.
+const SLICE_ZOOM = 0.9;
 // Room kept either side of the coil for its fringe field, world units.
 const SLICE_WORLD_MARGIN = 4.6;
 
@@ -7213,7 +7212,7 @@ function SliceView({ switcher, active }) {
       const span = geo.base - 1 + (geo.E ?? 0);
       const worldW =
         Math.max(span + 1, 3) * SLICE_PITCH + SLICE_WORLD_MARGIN;
-      const scale = Math.min(
+      const scale = SLICE_ZOOM * Math.min(
         width / worldW,
         height / SLICE_WORLD_H,
       );
@@ -7852,28 +7851,37 @@ function SliceView({ switcher, active }) {
           outline: none;
         }
 
-        .slice-progress .progress-hit:focus-visible .progress-bar {
-          border-color: rgba(98, 230, 255, 0.6);
+        .slice-progress .progress-hit:focus-visible .slice-bar {
+          background-color: rgba(127, 197, 229, 0.3);
         }
 
         /* The draw loop moves the fill every frame, so no easing. */
         .slice-fill {
           transition: none;
+          border-radius: 0;
         }
 
-        /* One tick per turn. */
-        .slice-bar::after {
-          content: '';
-          position: absolute;
-          inset: 0;
-          background: repeating-linear-gradient(
-            90deg,
-            transparent 0,
-            transparent calc(10% - 1px),
-            rgba(5, 8, 13, 0.9) calc(10% - 1px),
-            rgba(5, 8, 13, 0.9) 10%
-          );
-          pointer-events: none;
+        /*
+         * One rounded block per turn (SLICE_MAX_TURNS = 10). A repeating
+         * mask cuts the track and the fill into separate lumps with gaps.
+         */
+        .progress-bar.slice-bar {
+          height: 14px;
+          border: 0;
+          border-radius: 0;
+          background-color: rgba(127, 197, 229, 0.16);
+          transition: background-color .15s ease;
+          --lump: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 14' preserveAspectRatio='none'%3E%3Crect x='3' y='0' width='94' height='14' rx='5'/%3E%3C/svg%3E");
+          -webkit-mask-image: var(--lump);
+          mask-image: var(--lump);
+          -webkit-mask-size: 10% 100%;
+          mask-size: 10% 100%;
+          -webkit-mask-repeat: repeat-x;
+          mask-repeat: repeat-x;
+        }
+
+        .slice-progress .progress-hit:hover .slice-bar {
+          background-color: rgba(127, 197, 229, 0.26);
         }
 
         /* The header floats over the stage so the sim gets the full height.
