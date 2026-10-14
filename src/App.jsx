@@ -7070,8 +7070,6 @@ function SliceView({ switcher, active }) {
   const [selection, setSelection] = useState({ a: null, b: null });
   const [probe, setProbe] = useState(null);
   const [miniTick, setMiniTick] = useState(0);
-  // Pulse the progress bar when this screen first opens, until used.
-  const [barAttention, setBarAttention] = useState(true);
 
   const dir = reversed ? -1 : 1;
   const spacing = 9 / density;
@@ -7902,13 +7900,6 @@ function SliceView({ switcher, active }) {
           gap: 8px 14px;
         }
 
-        .slice-sub {
-          margin: 8px 0 0;
-          color: #8fb1c1;
-          font-size: 12.5px;
-          line-height: 1.4;
-        }
-
         .slice-slider {
           grid-template-columns: auto;
           padding: 7px 12px;
@@ -8307,11 +8298,6 @@ function SliceView({ switcher, active }) {
             <h1 className="title">
               Slice through the solenoid
             </h1>
-
-            <p className="slice-sub">
-              Each turn pierces the page twice. Click two crossings
-              to compare their fields.
-            </p>
           </div>
 
           <div className="top-controls">
@@ -8565,10 +8551,7 @@ function SliceView({ switcher, active }) {
           </div>
 
           {/* Unwrap · Wrap · progress */}
-          <div
-            className="progress-row"
-            onPointerDownCapture={() => setBarAttention(false)}
-          >
+          <div className="progress-row">
             <button
               className="control"
               onClick={handleUnwrap}
@@ -8599,16 +8582,8 @@ function SliceView({ switcher, active }) {
               }}
               onKeyDown={handleProgressKey}
             >
-              {barAttention && (
-                <span className="bar-hint" aria-hidden="true">
-                  Click here
-                </span>
-              )}
-
               <div
-                className={`progress-bar slice-bar${
-                  barAttention ? ' attention' : ''
-                }`}
+                className="progress-bar slice-bar"
               >
                 <div
                   ref={progressFillRef}
