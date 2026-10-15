@@ -7851,6 +7851,32 @@ function SliceView({ switcher, active }) {
           outline: none;
         }
 
+        .slice-foot {
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+          grid-template-areas: "left switch right";
+          align-items: center;
+          column-gap: 12px;
+          row-gap: 4px;
+          margin-top: 4px;
+          font-size: 11px;
+          color: #7f9dad;
+        }
+
+        .slice-foot .progress-switch {
+          grid-area: switch;
+          margin-top: 0;
+        }
+
+        .slice-foot-left {
+          grid-area: left;
+        }
+
+        .slice-foot-right {
+          grid-area: right;
+          text-align: right;
+        }
+
         .slice-progress .progress-hit:focus-visible .slice-bar {
           background-color: rgba(127, 197, 229, 0.3);
         }
@@ -8268,6 +8294,13 @@ function SliceView({ switcher, active }) {
             padding: 2px 16px 14px;
           }
 
+          .slice-foot {
+            grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+            grid-template-areas:
+              "switch switch"
+              "left   right";
+          }
+
           .slice-legend {
             left: 12px;
             right: 12px;
@@ -8555,18 +8588,6 @@ function SliceView({ switcher, active }) {
         </section>
 
         <div className="slice-progress">
-          <div className="progress-meta">
-            <span>
-              {turns} of {SLICE_MAX_TURNS} turns wrapped
-            </span>
-
-            <span>
-              {turns === SLICE_MAX_TURNS
-                ? 'Coil complete'
-                : 'Click the bar to jump to a turn count'}
-            </span>
-          </div>
-
           {/* Unwrap · Wrap · progress */}
           <div className="progress-row">
             <button
@@ -8613,8 +8634,21 @@ function SliceView({ switcher, active }) {
             </div>
           </div>
 
-          <div className="progress-switch">
-            {switcher}
+          {/* Status text either side of the view switcher, under the bar */}
+          <div className="slice-foot">
+            <span className="slice-foot-left">
+              {turns} of {SLICE_MAX_TURNS} turns wrapped
+            </span>
+
+            <div className="progress-switch">
+              {switcher}
+            </div>
+
+            <span className="slice-foot-right">
+              {turns === SLICE_MAX_TURNS
+                ? 'Coil complete'
+                : 'Click the bar to jump to a turn count'}
+            </span>
           </div>
         </div>
       </div>
