@@ -4456,8 +4456,10 @@ function CoilView({ switcher }) {
           font-weight: 750;
         }
 
+        /* White in both light and dark mode (index.css darkens h1). */
         .title {
           margin: 0;
+          color: #fff;
           font-size: clamp(
             24px,
             3vw,
@@ -8684,13 +8686,49 @@ function ScreenSwitcher({ screen, onChange }) {
   );
 }
 
+/*
+ * Each screen has its own address: #3D and #cross-section. No hash (or
+ * an unknown one) opens the 3D coil, so plain /solenoid works as before.
+ */
+const SCREEN_HASHES = {
+  coil: '#3D',
+  slice: '#cross-section',
+};
+
+function screenFromHash(hash) {
+  return hash.toLowerCase() === SCREEN_HASHES.slice.toLowerCase()
+    ? 'slice'
+    : 'coil';
+}
+
 export default function App() {
-  const [screen, setScreen] = useState('coil');
-  const [sliceOpened, setSliceOpened] = useState(false);
+  const [screen, setScreen] = useState(() =>
+    screenFromHash(window.location.hash),
+  );
+  const [sliceOpened, setSliceOpened] = useState(
+    () => screen === 'slice',
+  );
+
+  // Follow the address: typed hashes and the back/forward buttons.
+  useEffect(() => {
+    function onHashChange() {
+      const next = screenFromHash(window.location.hash);
+      if (next === 'slice') setSliceOpened(true);
+      setScreen(next);
+    }
+
+    window.addEventListener('hashchange', onHashChange);
+    return () => window.removeEventListener('hashchange', onHashChange);
+  }, []);
 
   function changeScreen(next) {
     if (next === 'slice') setSliceOpened(true);
     setScreen(next);
+
+    // Record the screen in the address, so it can be shared or bookmarked.
+    if (window.location.hash !== SCREEN_HASHES[next]) {
+      window.location.hash = SCREEN_HASHES[next];
+    }
   }
 
   const switcher = (
